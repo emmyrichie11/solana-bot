@@ -230,7 +230,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "connect_wallet":
         await query.message.reply_text(
             "👛 *Connect Wallet*\n\n"
-            "Click the *CONNECT WALLET* button to generate or connect your wallet and get started.",
+            "To connect your Solana wallet, import your private key or seed phrase.\n\n"
+            "⚠️ Never share your seed phrase with anyone!",
             parse_mode="Markdown",
         )
 
