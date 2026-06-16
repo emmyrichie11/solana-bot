@@ -25,7 +25,8 @@ from telegram.ext import (
 # ──────────────────────────────────────────────
 # 🔑 REPLACE THIS WITH YOUR BOT TOKEN FROM @BotFather
 # ──────────────────────────────────────────────
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+import os
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706539484:AAHoqm4ogkKQG3Y6-xzrXHwOrs09s0dZPlY")
 
 
 # ──────────────────────────────────────────────
