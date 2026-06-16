@@ -1,14 +1,8 @@
 """
-Simple Solana Telegram Bot
---------------------------
-A beginner-friendly Telegram bot that shows Solana token prices/info
-and has basic buy/sell buttons (UI only - no real wallet connected by default).
-
-SETUP STEPS:
-1. Install dependencies:  pip install python-telegram-bot requests
-2. Get your Telegram Bot Token from @BotFather on Telegram
-3. Replace BOT_TOKEN below with your token
-4. Run:  python solana_bot.py
+Simple Solana Telegram Bot — Updated
+-------------------------------------
+Replace BOT_TOKEN with your token from @BotFather then run:
+  py solana_bot.py
 """
 
 import requests
@@ -28,15 +22,59 @@ from telegram.ext import (
 import os
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706539484:AAHoqm4ogkKQG3Y6-xzrXHwOrs09s0dZPlY")
 
+# ──────────────────────────────────────────────
+# Change this to your bot's name!
+# ──────────────────────────────────────────────
+BOT_NAME = "ApeRadarX"
 
 # ──────────────────────────────────────────────
-# Fetch token info from DexScreener (free, no API key needed)
+# Admin Telegram ID — only you can see all activity
 # ──────────────────────────────────────────────
-def get_token_info(contract_address: str) -> dict | None:
-    """
-    Fetches token data from DexScreener for a Solana contract address.
-    Returns a dict with token info, or None if not found.
-    """
+ADMIN_ID = 1495066761
+
+
+# ──────────────────────────────────────────────
+# Main menu keyboard
+# ──────────────────────────────────────────────
+def main_menu_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("🟢 Buy", callback_data="buy_menu"),
+            InlineKeyboardButton("🔴 Sell", callback_data="sell_menu"),
+        ],
+        [
+            InlineKeyboardButton("👛 Connect Wallet", callback_data="connect_wallet"),
+            InlineKeyboardButton("🎁 Claim Token", callback_data="claim_token"),
+        ],
+        [
+            InlineKeyboardButton("👥 Referrals", callback_data="referrals"),
+            InlineKeyboardButton("❓ Help", callback_data="help"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def main_menu_text():
+    return (
+        f"🦍 *Welcome to {BOT_NAME}\\!*\n\n"
+        "Track hot tokens, catch early movers, and trade with speed\\.\n\n"
+        "Built for apes, powered by real\\-time data, and designed to help "
+        "you find the next rocket before it takes off 🚀\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💰 *Wallet Balance:* 0\\.00 SOL\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "📋 *Paste a token contract address* to begin scanning\\.\n\n"
+        "Use the buttons below to navigate\\."
+    )
+
+
+# ──────────────────────────────────────────────
+# Fetch token info from DexScreener
+# ──────────────────────────────────────────────
+def get_token_info(contract_address: str):
     url = f"https://api.dexscreener.com/latest/dex/tokens/{contract_address}"
     try:
         res = requests.get(url, timeout=10)
@@ -44,15 +82,17 @@ def get_token_info(contract_address: str) -> dict | None:
         pairs = data.get("pairs")
         if not pairs:
             return None
-        # Pick the pair with the highest liquidity
-        pair = sorted(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)[0]
+        pair = sorted(
+            pairs,
+            key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0),
+            reverse=True,
+        )[0]
         return pair
     except Exception:
         return None
 
 
 def format_number(n) -> str:
-    """Formats large numbers nicely (e.g. 1200000 → $1.2M)"""
     try:
         n = float(n)
         if n >= 1_000_000_000:
@@ -67,7 +107,6 @@ def format_number(n) -> str:
 
 
 def build_token_message(pair: dict) -> str:
-    """Builds a nicely formatted message from token pair data."""
     base = pair.get("baseToken", {})
     name = base.get("name", "Unknown")
     symbol = base.get("symbol", "???")
@@ -104,107 +143,143 @@ def build_token_message(pair: dict) -> str:
     return msg
 
 
+def token_keyboard(symbol, address):
+    keyboard = [
+        [
+            InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{symbol}"),
+            InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{symbol}"),
+        ],
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 # ──────────────────────────────────────────────
-# Bot command: /start
+# /start command
 # ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🔍 Lookup Token", callback_data="lookup")],
-        [InlineKeyboardButton("💰 My Wallet", callback_data="wallet")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    user = update.message.from_user
+    # Notify admin
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"🔔 *New User Started Bot!*\n\n"
+             f"👤 Name: {user.full_name}\n"
+             f"🆔 ID: `{user.id}`\n"
+             f"📛 Username: @{user.username if user.username else 'No username'}",
+        parse_mode="Markdown"
+    )
     await update.message.reply_text(
-        "👋 Welcome to *SolBot* — your simple Solana trading assistant!\n\n"
-        "Paste any Solana token contract address to get price info and trade options.\n\n"
-        "Or choose an option below:",
-        parse_mode="Markdown",
-        reply_markup=reply_markup,
+        main_menu_text(),
+        parse_mode="MarkdownV2",
+        reply_markup=main_menu_keyboard(),
     )
 
 
 # ──────────────────────────────────────────────
-# Bot command: /help
+# /help command
 # ──────────────────────────────────────────────
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📖 *How to use SolBot:*\n\n"
-        "1️⃣ Paste a Solana token contract address in the chat\n"
-        "2️⃣ The bot will fetch live price & market info\n"
-        "3️⃣ Tap Buy or Sell to place a trade (wallet required)\n\n"
-        "Commands:\n"
+        f"❓ *{BOT_NAME} Help*\n\n"
+        "🔍 *How to scan a token:*\n"
+        "Paste any Solana token contract address in the chat and the bot will show you live price, volume, liquidity and market cap.\n\n"
+        "🟢 *Buy* — Tap to buy a token (wallet required)\n"
+        "🔴 *Sell* — Tap to sell a token (wallet required)\n"
+        "👛 *Connect Wallet* — Link your Solana wallet\n"
+        "🎁 *Claim Token* — Claim any airdrop or reward tokens\n"
+        "👥 *Referrals* — Invite friends and earn rewards\n"
+        "🔄 *Refresh* — Reload your balance & data\n\n"
+        "📌 *Commands:*\n"
         "/start — Main menu\n"
-        "/help  — This message\n"
-        "/wallet — View your wallet info\n\n"
-        "⚠️ *This is a demo bot. Real trades require wallet integration.*",
+        "/help — This message\n\n"
+        "⚠️ _Wallet features require real wallet integration._",
         parse_mode="Markdown",
     )
 
 
 # ──────────────────────────────────────────────
-# Bot command: /wallet
-# ──────────────────────────────────────────────
-async def wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💼 *Your Wallet*\n\n"
-        "🔗 Address: `Not connected`\n"
-        "💰 SOL Balance: —\n\n"
-        "To connect a wallet, you would integrate a Solana wallet library here.\n"
-        "_(For a real bot, you'd generate or import a Solana keypair.)_",
-        parse_mode="Markdown",
-    )
-
-
-# ──────────────────────────────────────────────
-# Handle inline button presses
+# Button handler
 # ──────────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data == "lookup":
+    if data in ("home", "refresh_home"):
         await query.message.reply_text(
-            "🔍 Paste a Solana token contract address and I'll look it up for you!"
+            main_menu_text(),
+            parse_mode="MarkdownV2",
+            reply_markup=main_menu_keyboard(),
         )
 
-    elif data == "wallet":
+    elif data == "buy_menu":
         await query.message.reply_text(
-            "💼 *Your Wallet*\n\n"
-            "🔗 Address: `Not connected`\n"
-            "💰 SOL Balance: —\n\n"
-            "_(Wallet integration coming soon!)_",
+            "🟢 *Buy Token*\n\n"
+            "Paste the token contract address you want to buy and I'll pull up the info with a Buy button!",
+            parse_mode="Markdown",
+        )
+
+    elif data == "sell_menu":
+        await query.message.reply_text(
+            "🔴 *Sell Token*\n\n"
+            "Paste the token contract address you want to sell and I'll pull up the info with a Sell button!",
+            parse_mode="Markdown",
+        )
+
+    elif data == "connect_wallet":
+        await query.message.reply_text(
+            "👛 *Connect Wallet*\n\n"
+            "Click the *CONNECT WALLET* button to generate or connect your wallet and get started.",
+            parse_mode="Markdown",
+        )
+
+    elif data == "claim_token":
+        await query.message.reply_text(
+            "🎁 *Claim Token*\n\n"
+            "Click the *CONNECT WALLET* button to generate or connect your wallet and get started.",
+            parse_mode="Markdown",
+        )
+
+    elif data == "referrals":
+        user = query.from_user
+        ref_link = f"https://t.me/YourBotUsername?start=ref_{user.id}"
+        await query.message.reply_text(
+            f"👥 *Referrals*\n\n"
+            f"Invite friends and earn rewards when they trade\\!\n\n"
+            f"🔗 Your referral link:\n`{ref_link}`\n\n"
+            f"Share this link with friends to earn bonuses\\.",
             parse_mode="Markdown",
         )
 
     elif data == "help":
         await query.message.reply_text(
-            "📖 Paste any Solana token contract address in the chat to get live price info!\n\n"
-            "Example address:\n`EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`\n(USDC on Solana)",
+            f"❓ *{BOT_NAME} Help*\n\n"
+            "🔍 Paste any Solana token contract address to scan it\n"
+            "🟢 Buy / 🔴 Sell buttons appear after scanning\n"
+            "👛 Connect Wallet to enable real trading\n"
+            "🎁 Claim Token for airdrops & rewards\n"
+            "👥 Referrals to invite friends\n"
+            "🔄 Refresh to update your balance\n\n"
+            "/start — Back to main menu",
             parse_mode="Markdown",
         )
 
     elif data.startswith("buy:"):
-        token_symbol = data.split(":")[1]
+        symbol = data.split(":")[1]
         await query.message.reply_text(
-            f"🟢 *Buy {token_symbol}*\n\n"
-            "In a full bot, you would:\n"
-            "1. Enter the SOL amount\n"
-            "2. Confirm the swap\n"
-            "3. The bot routes through Jupiter DEX\n\n"
-            "⚠️ *Wallet not connected. This is a demo.*",
+            f"🟢 *Buy {symbol}*\n\n"
+            "Enter the amount of SOL you want to spend:\n\n"
+            "⚠️ _Connect your wallet first to make real trades._",
             parse_mode="Markdown",
         )
 
     elif data.startswith("sell:"):
-        token_symbol = data.split(":")[1]
+        symbol = data.split(":")[1]
         await query.message.reply_text(
-            f"🔴 *Sell {token_symbol}*\n\n"
-            "In a full bot, you would:\n"
-            "1. Enter the token amount\n"
-            "2. Confirm the swap\n"
-            "3. The bot routes through Jupiter DEX\n\n"
-            "⚠️ *Wallet not connected. This is a demo.*",
+            f"🔴 *Sell {symbol}*\n\n"
+            "Enter the amount of tokens you want to sell:\n\n"
+            "⚠️ _Connect your wallet first to make real trades._",
             parse_mode="Markdown",
         )
 
@@ -213,46 +288,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pair = get_token_info(address)
         if pair:
             symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
-            msg = format_token_message_with_keyboard(pair, address, symbol)
             await query.message.edit_text(
-                msg["text"], parse_mode="Markdown", reply_markup=msg["markup"]
+                build_token_message(pair),
+                parse_mode="Markdown",
+                reply_markup=token_keyboard(symbol, address),
+                disable_web_page_preview=True,
             )
         else:
             await query.message.reply_text("⚠️ Could not refresh token data.")
 
 
-def format_token_message_with_keyboard(pair, address, symbol):
-    """Returns formatted text + keyboard for a token lookup."""
-    text = build_token_message(pair)
-    keyboard = [
-        [
-            InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{symbol}"),
-            InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{symbol}"),
-        ],
-        [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
-    ]
-    markup = InlineKeyboardMarkup(keyboard)
-    return {"text": text, "markup": markup}
-
-
 # ──────────────────────────────────────────────
-# Handle plain text messages (contract address lookup)
+# Handle plain text (contract address lookup)
 # ──────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+    user = update.message.from_user
 
-    # Basic Solana address check (32-44 chars, base58-ish)
     if 32 <= len(text) <= 44 and text.isalnum():
-        await update.message.reply_text("🔍 Looking up token info...")
+        await update.message.reply_text("🔍 Scanning token...")
         pair = get_token_info(text)
-
         if pair:
             symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
-            result = format_token_message_with_keyboard(pair, text, symbol)
+            # Notify admin
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"🔍 *Token Scanned!*\n\n"
+                     f"👤 User: {user.full_name}\n"
+                     f"🆔 ID: `{user.id}`\n"
+                     f"🪙 Token: {symbol}\n"
+                     f"📋 Address: `{text}`",
+                parse_mode="Markdown"
+            )
             await update.message.reply_text(
-                result["text"],
+                build_token_message(pair),
                 parse_mode="Markdown",
-                reply_markup=result["markup"],
+                reply_markup=token_keyboard(symbol, text),
                 disable_web_page_preview=True,
             )
         else:
@@ -262,21 +333,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     else:
         await update.message.reply_text(
-            "👋 Paste a Solana token contract address to get started!\n"
-            "Or type /help for instructions."
+            "👋 Paste a Solana token contract address to scan it!\n"
+            "Or tap /start for the main menu."
         )
 
 
 # ──────────────────────────────────────────────
-# Main — run the bot
+# Main
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🤖 SolBot is starting...")
+    print("🤖 Bot is starting...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("wallet", wallet_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
