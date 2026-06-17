@@ -269,7 +269,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "claim_token":
         await query.message.reply_text(
             "🎁 *Claim Token*\n\n"
-            "Click the *CONNECT WALLET* button to generate or connect your wallet and get started.",
+            "To claim your token, please deposit *2 SOL* to your connected wallet first.\n\n"
+            "Once your deposit is confirmed, your tokens will be released automatically! 🚀",
             parse_mode="Markdown",
         )
 
