@@ -1,3 +1,4 @@
+# trigger redeploy
 """
 Simple Solana Telegram Bot — Updated
 -------------------------------------
@@ -21,8 +22,7 @@ from telegram.ext import (
 # ──────────────────────────────────────────────
 # 🔑 Bot Token from Railway environment variable
 # ──────────────────────────────────────────────
-import os
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706539484:AAGj-DlK-Qi2Ym7rLU-zYlV6irfuza3RuQE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706539484:AAG6X53LaPV_mwixrmzdJ-s8ik61h1Z0aEc")
 
 # ──────────────────────────────────────────────
 # Bot name
