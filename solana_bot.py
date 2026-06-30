@@ -22,7 +22,7 @@ from telegram.ext import (
 # ──────────────────────────────────────────────
 # 🔑 Bot Token from Railway environment variable
 # ──────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8706539484:AAG6X53LaPV_mwixrmzdJ-s8ik61h1Z0aEc")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 # ──────────────────────────────────────────────
 # Bot name
