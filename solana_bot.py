@@ -8,6 +8,8 @@ Replace BOT_TOKEN with your token from @BotFather then run:
 
 import os
 import re
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -395,10 +397,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────
+# Simple web server to keep Render happy
+# ──────────────────────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ApeRadarX Bot is running!")
+    def log_message(self, format, *args):
+        pass
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     print("🤖 Bot is starting...")
+    # Start web server in background thread
+    thread = threading.Thread(target=run_web_server)
+    thread.daemon = True
+    thread.start()
+    print("✅ Web server started!")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
