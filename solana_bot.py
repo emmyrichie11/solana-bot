@@ -25,7 +25,6 @@ ADMIN_ID = 1495066761
 PNL_ALLOWED = {1495066761, 6203945884, 8730420346}
 
 # Background image URL (hosted on GitHub)
-BG_URL = "https://raw.githubusercontent.com/emmyrichie11/solana-bot/main/pnl_background.jpg"
 
 waiting_for_wallet = {}
 waiting_for_pnl = {}
@@ -49,7 +48,11 @@ async def notify_admin(context, user, action, extra=""):
 
 # ─────────────────────────────────────────────
 # PnL Card Generator
-# ─────────────────────────────────────────────
+# Final plain 1536x1024 PnL template. The artwork is fixed; only dynamic
+# token data is drawn on top of the intentionally empty fields.
+PNL_TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pnl_template_final.png")
+
+
 def format_mcap(n):
     try:
         n = float(n)
@@ -59,183 +62,164 @@ def format_mcap(n):
         return f"${n:.0f}"
     except: return "N/A"
 
+
 def get_font(size):
     for p in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
     ]:
         try: return ImageFont.truetype(p, size)
         except: continue
     return ImageFont.load_default()
 
-def draw_glow_text(img, cx, y, text, font, color, glow_color):
-    draw = ImageDraw.Draw(img, "RGBA")
-    bbox = draw.textbbox((0,0), text, font=font)
-    w = bbox[2] - bbox[0]
-    x = cx - w // 2
-    glow = Image.new("RGBA", img.size, (0,0,0,0))
-    gd = ImageDraw.Draw(glow)
-    for r in range(18, 0, -3):
-        a = int(60 * (1 - r/18))
-        for ox in range(-r, r+1, 3):
-            for oy in range(-r, r+1, 3):
-                if ox*ox + oy*oy <= r*r*1.5:
-                    gd.text((x+ox, y+oy), text, font=font, fill=(*glow_color, min(a,180)))
-    glow = glow.filter(ImageFilter.GaussianBlur(4))
-    img = Image.alpha_composite(img.convert("RGBA"), glow)
-    d2 = ImageDraw.Draw(img)
-    d2.text((x+5, y+5), text, font=font, fill=(0,25,0,200))
-    d2.text((x+3, y+3), text, font=font, fill=(0,40,0,200))
-    d2.text((x, y), text, font=font, fill=color)
+
+def fit_font(text, max_width, start_size, min_size=16):
+    for size in range(start_size, min_size - 1, -2):
+        f = get_font(size)
+        b = f.getbbox(text)
+        if b[2] - b[0] <= max_width:
+            return f
+    return get_font(min_size)
+
+
+def center_text(draw, box, text, font, fill, stroke_width=0, stroke_fill=None):
+    x1, y1, x2, y2 = box
+    b = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    tw, th = b[2] - b[0], b[3] - b[1]
+    x = x1 + (x2 - x1 - tw) / 2
+    y = y1 + (y2 - y1 - th) / 2 - b[1]
+    draw.text((x, y), text, font=font, fill=fill,
+              stroke_width=stroke_width, stroke_fill=stroke_fill)
+
+
+def _download_logo(url):
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        return Image.open(io.BytesIO(r.content)).convert("RGBA")
+    except:
+        return None
+
+
+def _draw_logo(img, logo_url):
+    # Remove the sample coin completely, then recreate the gold ring and place
+    # the live token logo inside it. This prevents the old token name/artwork
+    # from remaining around the new logo.
+    cx, cy = 768, 161
+    outer_r, inner_r = 112, 84
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer, "RGBA")
+    d.ellipse((cx-outer_r, cy-outer_r, cx+outer_r, cy+outer_r), fill=(3, 7, 2, 255), outline=(185, 205, 55, 255), width=5)
+    d.ellipse((cx-inner_r, cy-inner_r, cx+inner_r, cy+inner_r), fill=(8, 15, 5, 255), outline=(225, 190, 45, 255), width=3)
+    glow = layer.filter(ImageFilter.GaussianBlur(8))
+    img = Image.alpha_composite(img, glow)
+    img = Image.alpha_composite(img, layer)
+    logo = _download_logo(logo_url)
+    if logo is not None:
+        logo.thumbnail((inner_r*2-10, inner_r*2-10), Image.LANCZOS)
+        mask = Image.new("L", logo.size, 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, logo.width-1, logo.height-1), fill=255)
+        logo.putalpha(mask)
+        img.alpha_composite(logo, (cx-logo.width//2, cy-logo.height//2))
     return img
 
-def generate_pnl_card(token_symbol, buy_mcap, current_mcap, username, token_logo_url=None):
-    W, H = 1000, 560
-    GREEN = (57, 255, 20)
-    GOLD = (220, 180, 30)
-    WHITE = (255, 255, 255)
-    DARK_GREEN = (30, 180, 10)
-    multiplier = current_mcap / buy_mcap if buy_mcap > 0 else 1.0
 
-    # Load background from GitHub
-    try:
-        resp = requests.get(BG_URL, timeout=10)
-        bg = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-        bg = bg.resize((W, H), Image.LANCZOS)
-    except:
-        bg = Image.new("RGBA", (W, H), (2, 10, 2, 255))
+def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username, token_logo_url=None):
+    if not os.path.exists(PNL_TEMPLATE_PATH):
+        raise FileNotFoundError("pnl_template_final.png is missing beside the bot file.")
 
-    img = bg.copy()
+    img = Image.open(PNL_TEMPLATE_PATH).convert("RGBA")
+    if img.size != (1536, 1024):
+        img = img.resize((1536, 1024), Image.LANCZOS)
+
+    green = (165, 255, 35, 255)
+    white = (255, 255, 255, 255)
+    multiplier = float(current_mcap) / float(buy_mcap) if float(buy_mcap) > 0 else 1.0
+
+    # Name area is intentionally placed in the clean space above CALLED AT.
+    # This does not cover any existing artwork.
     draw = ImageDraw.Draw(img, "RGBA")
-    draw.rectangle([0, 0, W, H], fill=(0, 0, 0, 35))
+    name = str(token_name or token_symbol or "TOKEN").strip()
+    symbol = str(token_symbol or "TOKEN").upper().strip()
+    name = re.sub(r"\s+", " ", name)
+    if len(name) > 26:
+        name = name[:25].rstrip() + "…"
 
-    # Fonts
-    f_token = get_font(58)
-    f_mult = get_font(140)
-    f_gain = get_font(22)
-    f_label = get_font(14)
-    f_value = get_font(28)
-    f_bottom = get_font(22)
+    name_font = fit_font(name, 560, 66, 28)
+    center_text(draw, (70, 205, 635, 255), name, name_font, white,
+                stroke_width=2, stroke_fill=(0, 30, 0, 210))
+    symbol_text = f"({symbol})"
+    center_text(draw, (85, 248, 500, 290), symbol_text,
+                fit_font(symbol_text, 390, 30, 18), green)
 
-    # Token name (cover old, draw new)
-    draw.rectangle([0, 0, 340, 105], fill=(0,0,0,180))
-    draw.text((22, 12), token_symbol.upper(), font=f_token, fill=(200, 235, 140))
+    # Called-at value inside the existing empty panel.
+    called_box = (175, 365, 390, 415)
+    center_text(draw, called_box, format_mcap(buy_mcap),
+                fit_font(format_mcap(buy_mcap), 205, 46, 24), white)
 
-    # Called at badge
-    draw.rounded_rectangle([18, 80, 205, 150], radius=8, fill=(0,15,0,210))
-    draw.rounded_rectangle([18, 80, 205, 150], radius=8, outline=(*GREEN,160), width=2)
-    cx2, cy2 = 44, 115
-    draw.ellipse([cx2-12,cy2-12,cx2+12,cy2+12], outline=GREEN, width=2)
-    draw.ellipse([cx2-6,cy2-6,cx2+6,cy2+6], outline=GREEN, width=1)
-    draw.line([cx2-16,cy2,cx2+16,cy2], fill=GREEN, width=1)
-    draw.line([cx2,cy2-16,cx2,cy2+16], fill=GREEN, width=1)
-    draw.text((62, 86), "CALLED AT", font=f_label, fill=GREEN)
-    draw.text((62, 106), format_mcap(buy_mcap), font=f_value, fill=WHITE)
+    # Replace the sample coin face with the actual token logo.
+    img = _draw_logo(img, token_logo_url)
 
-    # Token logo (top center)
-    lx, ly, ls = W//2, 62, 100
-    draw.ellipse([lx-ls//2-18, ly-ls//2-18, lx+ls//2+18, ly+ls//2+18], fill=(0,5,0,230))
-    draw.ellipse([lx-ls//2-4, ly-ls//2-4, lx+ls//2+4, ly+ls//2+4], fill=(*GOLD, 255))
+    # Hide the sample multiplier with a controlled dark-green panel, then draw
+    # the live multiplier. This keeps the supplied artwork's surrounding glow
+    # and arrow while guaranteeing the old sample number cannot show through.
+    panel = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    pp = ImageDraw.Draw(panel, "RGBA")
+    pp.rounded_rectangle((405, 300, 1300, 560), radius=18, fill=(0, 20, 4, 255))
+    glow_panel = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gp = ImageDraw.Draw(glow_panel, "RGBA")
+    gp.ellipse((430, 315, 1275, 565), fill=(75, 220, 25, 45))
+    glow_panel = glow_panel.filter(ImageFilter.GaussianBlur(28))
+    img = Image.alpha_composite(img, glow_panel)
+    img = Image.alpha_composite(img, panel)
 
-    logo_loaded = False
-    if token_logo_url:
-        try:
-            r = requests.get(token_logo_url, timeout=6)
-            li = Image.open(io.BytesIO(r.content)).convert("RGBA")
-            li = li.resize((ls, ls), Image.LANCZOS)
-            mask = Image.new("L", (ls, ls), 0)
-            ImageDraw.Draw(mask).ellipse([0,0,ls,ls], fill=255)
-            li.putalpha(mask)
-            img.paste(li, (lx-ls//2, ly-ls//2), li)
-            draw = ImageDraw.Draw(img, "RGBA")
-            logo_loaded = True
-        except: pass
+    mult = f"{multiplier:.1f}X"
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer, "RGBA")
+    mf = fit_font(mult, 820, 225, 100)
+    bb = ld.textbbox((0, 0), mult, font=mf, stroke_width=4)
+    tw, th = bb[2]-bb[0], bb[3]-bb[1]
+    x = 850 - tw/2
+    y = 430 - th/2 - bb[1]
+    for sw, alpha in ((26, 28), (17, 48), (10, 80)):
+        ld.text((x, y), mult, font=mf, fill=(80,255,0,30),
+                stroke_width=sw, stroke_fill=(90,255,0,alpha))
+    img = Image.alpha_composite(img, layer.filter(ImageFilter.GaussianBlur(6)))
+    ImageDraw.Draw(img, "RGBA").text(
+        (x, y), mult, font=mf, fill=(125,205,55,255),
+        stroke_width=4, stroke_fill=(220,255,80,255)
+    )
 
-    if not logo_loaded:
-        draw.ellipse([lx-ls//2, ly-ls//2, lx+ls//2, ly+ls//2], fill=(10,40,10))
-        sym = token_symbol[:4].upper()
-        bbox = draw.textbbox((0,0), sym, font=get_font(26))
-        sw = bbox[2]-bbox[0]
-        draw.text((lx-sw//2, ly-16), sym, font=get_font(26), fill=(200,255,150))
-
-    # Logo glow
-    glow = Image.new("RGBA", (W,H), (0,0,0,0))
-    gd = ImageDraw.Draw(glow)
-    for r in range(80,0,-15):
-        gd.ellipse([lx-r,ly-r,lx+r,ly+r], fill=(*GOLD, int(18*(1-r/80))))
-    glow = glow.filter(ImageFilter.GaussianBlur(10))
-    img = Image.alpha_composite(img, glow)
+    # Hide the sample GAIN text before writing the live value.
+    gain_patch = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gpd = ImageDraw.Draw(gain_patch, "RGBA")
+    gpd.rounded_rectangle((555, 575, 1010, 642), radius=10, fill=(0, 18, 3, 255))
+    img = Image.alpha_composite(img, gain_patch)
     draw = ImageDraw.Draw(img, "RGBA")
+    # Dynamic gain line in the cleaned bar.
+    gain = f"{multiplier:.1f}X GAIN"
+    center_text(draw, (565, 574, 1000, 640), gain,
+                fit_font(gain, 400, 42, 24), green)
 
-    # Big multiplier
-    mult_text = f"{multiplier:.1f}X"
-    my = 145
-    img = draw_glow_text(img, W//2, my, mult_text, f_mult, GREEN, DARK_GREEN)
-    draw = ImageDraw.Draw(img, "RGBA")
+    # Called by: keep the supplied person icon and label, add only the value.
+    caller = f"@{username}" if username else "@ApeRadarX"
+    center_text(draw, (390, 730, 730, 795), caller,
+                fit_font(caller, 320, 40, 22), white)
 
-    # Gain label
-    gain_text = f"🚀  {multiplier:.1f}X GAIN  🚀"
-    gain_y = my + 155
-    bbox2 = draw.textbbox((0,0), gain_text, font=f_gain)
-    gw = bbox2[2]-bbox2[0]
-    gx = W//2 - gw//2
-    draw.rectangle([gx-30, gain_y-6, gx+gw+30, gain_y+33], fill=(0,10,0,180))
-    draw.line([(gx-20, gain_y-3),(gx+gw+20, gain_y-3)], fill=(*GREEN,100), width=1)
-    draw.line([(gx-20, gain_y+29),(gx+gw+20, gain_y+29)], fill=(*GREEN,100), width=1)
-    draw.text((gx, gain_y), gain_text, font=f_gain, fill=GREEN)
+    # Current MCap.
+    current = format_mcap(current_mcap)
+    center_text(draw, (855, 730, 1170, 795), current,
+                fit_font(current, 300, 46, 24), white)
 
-    # Bottom info boxes
-    box_y = H - 142
-    box_h = 68
-    m = 22
-    gap = 14
-    box_w = (W - m*2 - gap) // 2
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG")
+    out.seek(0)
+    return out
 
-    for i, (lbl, val, itype) in enumerate([
-        ("CALLED BY", f"@{username}", "person"),
-        ("CURRENT MCAP", format_mcap(current_mcap), "money"),
-    ]):
-        bx = m + i*(box_w+gap)
-        draw.rectangle([bx-5, box_y-5, bx+box_w+5, box_y+box_h+5], fill=(0,5,0,220))
-        draw.rounded_rectangle([bx, box_y, bx+box_w, box_y+box_h], radius=12,
-                                fill=(0,18,0,200), outline=(*GREEN,140), width=2)
-        ic = bx+32, box_y+box_h//2
-        draw.ellipse([ic[0]-17,ic[1]-17,ic[0]+17,ic[1]+17], fill=(*GREEN,25), outline=(*GREEN,160))
-        if itype == "person":
-            draw.ellipse([ic[0]-7,ic[1]-11,ic[0]+7,ic[1]-1], fill=GREEN)
-            draw.arc([ic[0]-10,ic[1]-2,ic[0]+10,ic[1]+11], 0, 180, fill=GREEN, width=2)
-        else:
-            draw.text((ic[0]-8, ic[1]-11), "$", font=get_font(20), fill=GREEN)
-        draw.text((bx+58, box_y+8), lbl, font=f_label, fill=GREEN)
-        draw.text((bx+58, box_y+27), val, font=f_value, fill=WHITE)
-
-    # Bottom bar
-    bar_y = H - 58
-    draw.rectangle([0, bar_y, W, H], fill=(0,6,0,230))
-    draw.line([(0, bar_y),(W, bar_y)], fill=(*GREEN,60), width=1)
-
-    glow2 = Image.new("RGBA", (W,H), (0,0,0,0))
-    gd2 = ImageDraw.Draw(glow2)
-    gd2.ellipse([(W//2-280, bar_y-20),(W//2+280, H+10)], fill=(*GREEN,15))
-    glow2 = glow2.filter(ImageFilter.GaussianBlur(15))
-    img = Image.alpha_composite(img, glow2)
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    logo_bx = W//2 - 155
-    draw.ellipse([logo_bx, bar_y+13, logo_bx+36, bar_y+49], fill=(*GREEN,20), outline=(*GREEN,180))
-    draw.text((logo_bx+4, bar_y+17), "🦍", font=get_font(22))
-    draw.text((logo_bx+44, bar_y+18), "APEradarX", font=f_bottom, fill=GREEN)
-    div_x = W//2 + 28
-    draw.line([(div_x, bar_y+10),(div_x, H-10)], fill=(*GREEN,60), width=1)
-    draw.text((div_x+15, bar_y+18), "✈ @ApeRadarXBot", font=f_bottom, fill=GREEN)
-
-    out = img.convert("RGB")
-    buf = io.BytesIO()
-    out.save(buf, format="PNG", quality=95)
-    buf.seek(0)
-    return buf
-
+# ─────────────────────────────────────────────
 # ─────────────────────────────────────────────
 # Token helpers
 # ─────────────────────────────────────────────
@@ -395,10 +379,12 @@ async def button_handler(update, context):
         address = data.split(":")[1]
         pair = get_token_info(address)
         if pair:
-            symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
+            base_token = pair.get("baseToken", {})
+            name = base_token.get("name", "Unknown")
+            symbol = base_token.get("symbol", "TOKEN")
             current_mcap = pair.get("marketCap", 0)
             waiting_for_pnl[user.id] = {
-                "step": "buy_mcap", "address": address, "symbol": symbol,
+                "step": "buy_mcap", "address": address, "name": name, "symbol": symbol,
                 "current_mcap": float(current_mcap) if current_mcap else 0,
                 "logo_url": pair.get("info",{}).get("imageUrl"),
             }
@@ -477,10 +463,12 @@ async def handle_message(update, context):
             await update.message.reply_text("🔍 Fetching token info...")
             pair = get_token_info(text)
             if pair:
-                symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
+                base_token = pair.get("baseToken", {})
+                name = base_token.get("name", "Unknown")
+                symbol = base_token.get("symbol", "TOKEN")
                 current_mcap = pair.get("marketCap", 0)
                 waiting_for_pnl[user.id] = {
-                    "step": "buy_mcap", "address": text, "symbol": symbol,
+                    "step": "buy_mcap", "address": text, "name": name, "symbol": symbol,
                     "current_mcap": float(current_mcap) if current_mcap else 0,
                     "logo_url": pair.get("info",{}).get("imageUrl"),
                 }
@@ -497,13 +485,14 @@ async def handle_message(update, context):
         buy_mcap = parse_mcap_input(text)
         if buy_mcap and buy_mcap > 0:
             current_mcap = pnl_state["current_mcap"]
+            name = pnl_state.get("name", pnl_state.get("symbol", "TOKEN"))
             symbol = pnl_state["symbol"]
             logo_url = pnl_state.get("logo_url")
             username = user.username or user.first_name or "ApeRadarX"
             waiting_for_pnl[user.id] = None
             await update.message.reply_text("🎨 Generating your PnL card...")
             try:
-                card = generate_pnl_card(symbol, buy_mcap, current_mcap, username, logo_url)
+                card = generate_pnl_card(name, symbol, buy_mcap, current_mcap, username, logo_url)
                 multiplier = current_mcap / buy_mcap
                 await update.message.reply_photo(
                     photo=card,
