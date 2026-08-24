@@ -25,8 +25,8 @@ ADMIN_ID = 1495066761
 PNL_ALLOWED = {1495066761, 6203945884, 8730420346}
 
 # Background image URL (hosted on GitHub)
-BG_URL = "https://raw.githubusercontent.com/emmyrichie11/solana-bot/main/pnl_background.jpg"
-
+PNL_TEMPLATE_URL = "https://raw.githubusercontent.com/emmyrichie11/solana-bot/main/pnl_template.jpg"
+PNL_TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "pnl_template.jpg")
 waiting_for_wallet = {}
 waiting_for_pnl = {}
 
@@ -90,149 +90,166 @@ def draw_glow_text(img, cx, y, text, font, color, glow_color):
     d2.text((x, y), text, font=font, fill=color)
     return img
 
-def generate_pnl_card(token_symbol, buy_mcap, current_mcap, username, token_logo_url=None):
-    W, H = 1000, 560
-    GREEN = (57, 255, 20)
-    GOLD = (220, 180, 30)
-    WHITE = (255, 255, 255)
-    DARK_GREEN = (30, 180, 10)
-    multiplier = current_mcap / buy_mcap if buy_mcap > 0 else 1.0
-
-    # Load background from GitHub
+def _load_pnl_template(W, H):
+    """Load the new 4:3 PnL template. Local file is preferred; GitHub is fallback."""
     try:
-        resp = requests.get(BG_URL, timeout=10)
-        bg = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-        bg = bg.resize((W, H), Image.LANCZOS)
+        if os.path.exists(PNL_TEMPLATE_PATH):
+            bg = Image.open(PNL_TEMPLATE_PATH).convert("RGBA")
+        else:
+            resp = requests.get(PNL_TEMPLATE_URL, timeout=10)
+            resp.raise_for_status()
+            bg = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+        return bg.resize((W, H), Image.LANCZOS)
     except:
-        bg = Image.new("RGBA", (W, H), (2, 10, 2, 255))
+        return Image.new("RGBA", (W, H), (2, 10, 2, 255))
 
-    img = bg.copy()
+
+def _fit_font(text, max_width, start_size, font_paths=None):
+    paths = font_paths or [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    ]
+    size = start_size
+    while size >= 12:
+        for p in paths:
+            try:
+                f = ImageFont.truetype(p, size)
+                probe = Image.new("RGB", (10, 10))
+                d = ImageDraw.Draw(probe)
+                bb = d.textbbox((0, 0), text, font=f)
+                if bb[2] - bb[0] <= max_width:
+                    return f
+            except:
+                continue
+        size -= 2
+    return get_font(12)
+
+
+def _center_text(draw, box, text, font, fill, stroke_width=0, stroke_fill=None, y_offset=0):
+    x1, y1, x2, y2 = box
+    bb = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    tw = bb[2] - bb[0]
+    th = bb[3] - bb[1]
+    x = x1 + ((x2 - x1) - tw) / 2
+    y = y1 + ((y2 - y1) - th) / 2 - bb[1] + y_offset
+    draw.text(
+        (x, y), text, font=font, fill=fill,
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill
+    )
+
+
+def _neon_text(img, box, text, font, main=(155, 255, 25, 255)):
+    """Draw the large multiplier in the same neon-green style as the template."""
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    x1, y1, x2, y2 = box
+    bb = ld.textbbox((0, 0), text, font=font, stroke_width=3)
+    tw = bb[2] - bb[0]
+    th = bb[3] - bb[1]
+    x = x1 + ((x2 - x1) - tw) / 2
+    y = y1 + ((y2 - y1) - th) / 2 - bb[1]
+
+    for sw, alpha in [(18, 35), (12, 55), (7, 90)]:
+        ld.text((x, y), text, font=font, fill=(70, 255, 0, 25),
+                stroke_width=sw, stroke_fill=(80, 255, 0, alpha))
+    layer = layer.filter(ImageFilter.GaussianBlur(5))
+    img = Image.alpha_composite(img, layer)
+    d = ImageDraw.Draw(img)
+    d.text((x, y), text, font=font, fill=(95, 180, 35, 255),
+           stroke_width=4, stroke_fill=(205, 255, 50, 255))
+    return img
+
+
+def generate_pnl_card(token_symbol, buy_mcap, current_mcap, username, token_logo_url=None):
+    # New template is 4:3 (1536x1152), matching the supplied PnL image.
+    W, H = 1536, 1152
+    GREEN = (145, 255, 25, 255)
+    WHITE = (255, 255, 255, 255)
+    DARK = (0, 8, 0, 225)
+
+    multiplier = current_mcap / buy_mcap if buy_mcap > 0 else 1.0
+    img = _load_pnl_template(W, H)
     draw = ImageDraw.Draw(img, "RGBA")
-    draw.rectangle([0, 0, W, H], fill=(0, 0, 0, 35))
 
-    # Fonts
-    f_token = get_font(58)
-    f_mult = get_font(140)
-    f_gain = get_font(22)
-    f_label = get_font(14)
-    f_value = get_font(28)
-    f_bottom = get_font(22)
+    # ------------------------------------------------------------------
+    # Only the values that change are covered/re-drawn.
+    # The supplied image remains the complete background/layout.
+    # ------------------------------------------------------------------
 
-    # Token name (cover old, draw new)
-    draw.rectangle([0, 0, 340, 105], fill=(0,0,0,180))
-    draw.text((22, 12), token_symbol.upper(), font=f_token, fill=(200, 235, 140))
+    # Coin name / symbol area
+    draw.rectangle([120, 88, 585, 305], fill=(0, 0, 0, 205))
+    name = token_symbol.upper()
+    name_font = _fit_font(name, 445, 118)
+    _center_text(draw, (125, 92, 580, 220), name, name_font,
+                 (245, 255, 245, 255))
+    symbol_text = f"({token_symbol.upper()})"
+    symbol_font = _fit_font(symbol_text, 280, 50)
+    _center_text(draw, (150, 210, 555, 292), symbol_text, symbol_font,
+                 (220, 255, 145, 255))
 
-    # Called at badge
-    draw.rounded_rectangle([18, 80, 205, 150], radius=8, fill=(0,15,0,210))
-    draw.rounded_rectangle([18, 80, 205, 150], radius=8, outline=(*GREEN,160), width=2)
-    cx2, cy2 = 44, 115
-    draw.ellipse([cx2-12,cy2-12,cx2+12,cy2+12], outline=GREEN, width=2)
-    draw.ellipse([cx2-6,cy2-6,cx2+6,cy2+6], outline=GREEN, width=1)
-    draw.line([cx2-16,cy2,cx2+16,cy2], fill=GREEN, width=1)
-    draw.line([cx2,cy2-16,cx2,cy2+16], fill=GREEN, width=1)
-    draw.text((62, 86), "CALLED AT", font=f_label, fill=GREEN)
-    draw.text((62, 106), format_mcap(buy_mcap), font=f_value, fill=WHITE)
-
-    # Token logo (top center)
-    lx, ly, ls = W//2, 62, 100
-    draw.ellipse([lx-ls//2-18, ly-ls//2-18, lx+ls//2+18, ly+ls//2+18], fill=(0,5,0,230))
-    draw.ellipse([lx-ls//2-4, ly-ls//2-4, lx+ls//2+4, ly+ls//2+4], fill=(*GOLD, 255))
+    # Token logo area
+    draw.ellipse([575, 35, 875, 335], fill=(0, 5, 0, 235))
+    draw.ellipse([595, 55, 855, 315], outline=(185, 255, 55, 255), width=5)
+    draw.ellipse([612, 72, 838, 298], fill=(8, 18, 4, 255))
 
     logo_loaded = False
     if token_logo_url:
         try:
             r = requests.get(token_logo_url, timeout=6)
+            r.raise_for_status()
             li = Image.open(io.BytesIO(r.content)).convert("RGBA")
-            li = li.resize((ls, ls), Image.LANCZOS)
-            mask = Image.new("L", (ls, ls), 0)
-            ImageDraw.Draw(mask).ellipse([0,0,ls,ls], fill=255)
+            li = li.resize((210, 210), Image.LANCZOS)
+            mask = Image.new("L", (210, 210), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, 210, 210], fill=255)
             li.putalpha(mask)
-            img.paste(li, (lx-ls//2, ly-ls//2), li)
+            img.paste(li, (640, 80), li)
             draw = ImageDraw.Draw(img, "RGBA")
             logo_loaded = True
-        except: pass
+        except:
+            pass
 
     if not logo_loaded:
-        draw.ellipse([lx-ls//2, ly-ls//2, lx+ls//2, ly+ls//2], fill=(10,40,10))
-        sym = token_symbol[:4].upper()
-        bbox = draw.textbbox((0,0), sym, font=get_font(26))
-        sw = bbox[2]-bbox[0]
-        draw.text((lx-sw//2, ly-16), sym, font=get_font(26), fill=(200,255,150))
+        fallback = token_symbol[:4].upper()
+        fallback_font = _fit_font(fallback, 170, 55)
+        _center_text(draw, (625, 100, 865, 285), fallback, fallback_font,
+                     (210, 255, 120, 255))
 
-    # Logo glow
-    glow = Image.new("RGBA", (W,H), (0,0,0,0))
-    gd = ImageDraw.Draw(glow)
-    for r in range(80,0,-15):
-        gd.ellipse([lx-r,ly-r,lx+r,ly+r], fill=(*GOLD, int(18*(1-r/80))))
-    glow = glow.filter(ImageFilter.GaussianBlur(10))
-    img = Image.alpha_composite(img, glow)
-    draw = ImageDraw.Draw(img, "RGBA")
+    # Called-at value: preserve the original badge design and replace only its value.
+    draw.rectangle([180, 372, 390, 438], fill=(0, 8, 0, 215))
+    called_font = _fit_font(format_mcap(buy_mcap), 175, 54)
+    _center_text(draw, (190, 370, 388, 440), format_mcap(buy_mcap),
+                 called_font, WHITE)
 
-    # Big multiplier
-    mult_text = f"{multiplier:.1f}X"
-    my = 145
-    img = draw_glow_text(img, W//2, my, mult_text, f_mult, GREEN, DARK_GREEN)
+    # Main multiplier
+    draw.rectangle([385, 300, 1175, 590], fill=(0, 0, 0, 0))
+    mult_font = _fit_font(f"{multiplier:.1f}X", 760, 235)
+    img = _neon_text(img, (385, 300, 1175, 590), f"{multiplier:.1f}X", mult_font)
     draw = ImageDraw.Draw(img, "RGBA")
 
     # Gain label
+    draw.rectangle([385, 592, 1155, 665], fill=(0, 7, 0, 225))
     gain_text = f"🚀  {multiplier:.1f}X GAIN  🚀"
-    gain_y = my + 155
-    bbox2 = draw.textbbox((0,0), gain_text, font=f_gain)
-    gw = bbox2[2]-bbox2[0]
-    gx = W//2 - gw//2
-    draw.rectangle([gx-30, gain_y-6, gx+gw+30, gain_y+33], fill=(0,10,0,180))
-    draw.line([(gx-20, gain_y-3),(gx+gw+20, gain_y-3)], fill=(*GREEN,100), width=1)
-    draw.line([(gx-20, gain_y+29),(gx+gw+20, gain_y+29)], fill=(*GREEN,100), width=1)
-    draw.text((gx, gain_y), gain_text, font=f_gain, fill=GREEN)
+    gain_font = _fit_font(gain_text, 720, 42)
+    _center_text(draw, (390, 592, 1150, 664), gain_text, gain_font, GREEN)
 
-    # Bottom info boxes
-    box_y = H - 142
-    box_h = 68
-    m = 22
-    gap = 14
-    box_w = (W - m*2 - gap) // 2
+    # Called by
+    draw.rectangle([325, 742, 690, 822], fill=(0, 5, 0, 225))
+    called_by = f"@{username}"
+    called_by_font = _fit_font(called_by, 330, 46)
+    _center_text(draw, (325, 740, 690, 825), called_by, called_by_font, WHITE)
 
-    for i, (lbl, val, itype) in enumerate([
-        ("CALLED BY", f"@{username}", "person"),
-        ("CURRENT MCAP", format_mcap(current_mcap), "money"),
-    ]):
-        bx = m + i*(box_w+gap)
-        draw.rectangle([bx-5, box_y-5, bx+box_w+5, box_y+box_h+5], fill=(0,5,0,220))
-        draw.rounded_rectangle([bx, box_y, bx+box_w, box_y+box_h], radius=12,
-                                fill=(0,18,0,200), outline=(*GREEN,140), width=2)
-        ic = bx+32, box_y+box_h//2
-        draw.ellipse([ic[0]-17,ic[1]-17,ic[0]+17,ic[1]+17], fill=(*GREEN,25), outline=(*GREEN,160))
-        if itype == "person":
-            draw.ellipse([ic[0]-7,ic[1]-11,ic[0]+7,ic[1]-1], fill=GREEN)
-            draw.arc([ic[0]-10,ic[1]-2,ic[0]+10,ic[1]+11], 0, 180, fill=GREEN, width=2)
-        else:
-            draw.text((ic[0]-8, ic[1]-11), "$", font=get_font(20), fill=GREEN)
-        draw.text((bx+58, box_y+8), lbl, font=f_label, fill=GREEN)
-        draw.text((bx+58, box_y+27), val, font=f_value, fill=WHITE)
-
-    # Bottom bar
-    bar_y = H - 58
-    draw.rectangle([0, bar_y, W, H], fill=(0,6,0,230))
-    draw.line([(0, bar_y),(W, bar_y)], fill=(*GREEN,60), width=1)
-
-    glow2 = Image.new("RGBA", (W,H), (0,0,0,0))
-    gd2 = ImageDraw.Draw(glow2)
-    gd2.ellipse([(W//2-280, bar_y-20),(W//2+280, H+10)], fill=(*GREEN,15))
-    glow2 = glow2.filter(ImageFilter.GaussianBlur(15))
-    img = Image.alpha_composite(img, glow2)
-    draw = ImageDraw.Draw(img, "RGBA")
-
-    logo_bx = W//2 - 155
-    draw.ellipse([logo_bx, bar_y+13, logo_bx+36, bar_y+49], fill=(*GREEN,20), outline=(*GREEN,180))
-    draw.text((logo_bx+4, bar_y+17), "🦍", font=get_font(22))
-    draw.text((logo_bx+44, bar_y+18), "APEradarX", font=f_bottom, fill=GREEN)
-    div_x = W//2 + 28
-    draw.line([(div_x, bar_y+10),(div_x, H-10)], fill=(*GREEN,60), width=1)
-    draw.text((div_x+15, bar_y+18), "✈ @ApeRadarXBot", font=f_bottom, fill=GREEN)
+    # Current MCAP
+    draw.rectangle([820, 742, 1175, 822], fill=(0, 5, 0, 225))
+    mcap_text = format_mcap(current_mcap)
+    mcap_font = _fit_font(mcap_text, 320, 48)
+    _center_text(draw, (815, 740, 1180, 825), mcap_text, mcap_font, WHITE)
 
     out = img.convert("RGB")
     buf = io.BytesIO()
-    out.save(buf, format="PNG", quality=95)
+    out.save(buf, format="PNG")
     buf.seek(0)
     return buf
 
