@@ -90,148 +90,111 @@ def draw_glow_text(img, cx, y, text, font, color, glow_color):
     d2.text((x, y), text, font=font, fill=color)
     return img
 
-def generate_pnl_card(token_symbol, buy_mcap, current_mcap, username, token_logo_url=None):
-    """Generate the PnL card using the supplied 1536x1152 template."""
-    W, H = 1536, 1152
-    GREEN = (145, 255, 20, 255)
-    WHITE = (255, 255, 255, 255)
-    DARK = (0, 8, 2, 235)
-    multiplier = current_mcap / buy_mcap if buy_mcap > 0 else 1.0
-
-    # The new template is a file in the same GitHub folder as this bot.
-    template_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pnl_template.jpg")
+def _load_pnl_template(W, H):
+    # Exact supplied PnL artwork. Keep the design/background unchanged.
     try:
-        if os.path.exists(template_path):
-            bg = Image.open(template_path).convert("RGBA")
-        else:
-            resp = requests.get(BG_URL, timeout=10)
-            resp.raise_for_status()
-            bg = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-        bg = bg.resize((W, H), Image.LANCZOS)
+        resp = requests.get(BG_URL, timeout=10)
+        resp.raise_for_status()
+        bg = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+        return bg.resize((W, H), Image.LANCZOS)
     except Exception:
-        bg = Image.new("RGBA", (W, H), (2, 10, 2, 255))
+        # Local fallback when running with pnl_template.jpg beside this file.
+        local = os.path.join(os.path.dirname(__file__), "pnl_template.jpg")
+        if os.path.exists(local):
+            return Image.open(local).convert("RGBA").resize((W, H), Image.LANCZOS)
+        raise
 
-    img = bg.copy()
-    draw = ImageDraw.Draw(img, "RGBA")
 
-    def fit_font(text, max_width, start_size, min_size=20):
-        for size in range(start_size, min_size - 1, -2):
-            f = get_font(size)
-            bb = draw.textbbox((0, 0), text, font=f)
-            if bb[2] - bb[0] <= max_width:
-                return f
-        return get_font(min_size)
+def _font_fit(text, max_width, max_size, min_size=18):
+    for size in range(max_size, min_size - 1, -2):
+        f = get_font(size)
+        if ImageDraw.Draw(Image.new("RGB", (10, 10))).textbbox((0, 0), text, font=f)[2] <= max_width:
+            return f
+    return get_font(min_size)
 
-    def center_text(box, text, f, fill, stroke_width=0, stroke_fill=None):
-        x1, y1, x2, y2 = box
-        bb = draw.textbbox((0, 0), text, font=f, stroke_width=stroke_width)
-        tw = bb[2] - bb[0]
-        th = bb[3] - bb[1]
-        x = x1 + (x2 - x1 - tw) / 2
-        y = y1 + (y2 - y1 - th) / 2 - bb[1]
-        draw.text((x, y), text, font=f, fill=fill,
-                  stroke_width=stroke_width, stroke_fill=stroke_fill)
 
-    def soft_cover(box, color=(0, 8, 2, 235), feather=28):
-        """Cover only a dynamic field with a feathered patch; no hard black block."""
-        x1, y1, x2, y2 = box
-        patch = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        pd = ImageDraw.Draw(patch, "RGBA")
-        pd.rectangle([x1, y1, x2, y2], fill=color)
-        alpha = Image.new("L", img.size, 0)
-        ad = ImageDraw.Draw(alpha)
-        ad.rectangle([x1, y1, x2, y2], fill=color[3])
-        if feather:
-            blurred = alpha.filter(ImageFilter.GaussianBlur(feather))
-            # Keep the field opaque in its center so old sample text is fully hidden,
-            # while the outer edge fades smoothly into the original artwork.
-            inner = Image.new("L", img.size, 0)
-            idraw = ImageDraw.Draw(inner)
-            idraw.rectangle([x1+feather, y1+feather, x2-feather, y2-feather], fill=color[3])
-            alpha = Image.composite(inner, blurred, inner)
-        patch.putalpha(alpha)
-        img.alpha_composite(patch)
+def _center(draw, box, text, font, fill, stroke_width=0, stroke_fill=None):
+    x1, y1, x2, y2 = box
+    bb = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    x = x1 + (x2 - x1 - tw) / 2
+    y = y1 + (y2 - y1 - th) / 2 - bb[1]
+    draw.text((x, y), text, font=font, fill=fill,
+              stroke_width=stroke_width, stroke_fill=stroke_fill)
 
-    # ── COIN NAME ──────────────────────────────────────────────────────
-    # The original template's BONK/BONK text is the only thing replaced here.
-    soft_cover((125, 100, 555, 305), (0, 8, 2, 225), 24)
-    name = token_symbol.upper()
-    f_name = fit_font(name, 410, 132, 48)
-    center_text((135, 102, 545, 225), name, f_name, WHITE,
-                stroke_width=2, stroke_fill=(205, 255, 120, 255))
-    ticker = f"({name})"
-    f_ticker = fit_font(ticker, 300, 58, 28)
-    center_text((160, 222, 530, 302), ticker, f_ticker, (220, 255, 145, 255))
 
-    # ── TOKEN LOGO ─────────────────────────────────────────────────────
-    # Keep the template's outer coin/ring; replace only the inner artwork.
-    lx, ly = 720, 184
-    inner = 168
+def _texture_multiplier(base_img, text, center_x, box, max_size=250):
+    W, H = base_img.size
+    draw = ImageDraw.Draw(base_img, "RGBA")
+    font = _font_fit(text, box[2]-box[0], max_size, 90)
+    bb = draw.textbbox((0,0), text, font=font, stroke_width=3)
+    tw, th = bb[2]-bb[0], bb[3]-bb[1]
+    x = center_x - tw/2
+    y = box[1] + (box[3]-box[1]-th)/2 - bb[1]
+    glow = Image.new("RGBA", (W,H), (0,0,0,0))
+    gd = ImageDraw.Draw(glow, "RGBA")
+    for sw, alpha in ((24,45),(16,80),(9,115)):
+        gd.text((x,y), text, font=font, fill=(100,190,40,255),
+                stroke_width=sw, stroke_fill=(80,255,0,alpha))
+    glow = glow.filter(ImageFilter.GaussianBlur(8))
+    base_img = Image.alpha_composite(base_img.convert("RGBA"), glow)
+    d = ImageDraw.Draw(base_img, "RGBA")
+    d.text((x,y), text, font=font, fill=(100,190,40,255),
+           stroke_width=4, stroke_fill=(205,255,55,255))
+    return base_img
+
+def generate_pnl_card(token_symbol, buy_mcap, current_mcap, username, token_logo_url=None):
+    W, H = 1536, 1152
+    WHITE=(255,255,255,255); GREEN=(145,255,25,255); DARK=(0,8,2,255)
+    multiplier=current_mcap/buy_mcap if buy_mcap>0 else 1.0
+    img=_load_pnl_template(W,H); draw=ImageDraw.Draw(img,"RGBA")
+
+    # Token name/ticker.
+    draw.rectangle([115,95,530,320],fill=DARK)
+    symbol=str(token_symbol or "TOKEN").upper()
+    _center(draw,(120,105,525,245),symbol,_font_fit(symbol,400,130),WHITE)
+    _center(draw,(150,245,500,315),f"({symbol})",_font_fit(f"({symbol})",330,52),(220,255,145,255))
+
+    # Token logo inside the original ring.
+    draw.ellipse([700,115,865,280],fill=DARK)
     if token_logo_url:
         try:
-            r = requests.get(token_logo_url, timeout=8)
-            r.raise_for_status()
-            li = Image.open(io.BytesIO(r.content)).convert("RGBA")
-            li.thumbnail((inner, inner), Image.LANCZOS)
-            logo_canvas = Image.new("RGBA", (inner, inner), (0, 0, 0, 0))
-            logo_canvas.paste(li, ((inner-li.width)//2, (inner-li.height)//2), li)
-            mask = Image.new("L", (inner, inner), 0)
-            ImageDraw.Draw(mask).ellipse([0, 0, inner-1, inner-1], fill=255)
-            logo_canvas.putalpha(mask)
-            # Dark/transparent cover for the old dog artwork, then new logo.
-            draw.ellipse([lx-inner//2, ly-inner//2, lx+inner//2, ly+inner//2], fill=(0, 0, 0, 255))
-            img.alpha_composite(logo_canvas, (lx-inner//2, ly-inner//2))
-        except Exception:
-            pass
+            r=requests.get(token_logo_url,timeout=7); r.raise_for_status()
+            logo=Image.open(io.BytesIO(r.content)).convert("RGBA").resize((145,145),Image.LANCZOS)
+            lm=Image.new("L",(145,145),0); ImageDraw.Draw(lm).ellipse([0,0,144,144],fill=255)
+            logo.putalpha(lm); img.paste(logo,(710,122),logo)
+        except Exception: pass
 
-    # ── CALLED AT VALUE ─────────────────────────────────────────────────
-    soft_cover((195, 365, 375, 430), (0, 8, 2, 240), 10)
-    center_text((195, 365, 375, 430), format_mcap(buy_mcap),
-                fit_font(format_mcap(buy_mcap), 160, 56, 26), WHITE)
+    # Called-at panel value.
+    draw=ImageDraw.Draw(img,"RGBA")
+    draw.rectangle([185,350,380,465],fill=DARK)
+    draw.text((205,365),"CALLED AT",font=_font_fit("CALLED AT",150,30),fill=GREEN)
+    called=format_mcap(buy_mcap)
+    _center(draw,(195,395,370,455),called,_font_fit(called,165,55),WHITE)
 
-    # ── MAIN MULTIPLIER ─────────────────────────────────────────────────
-    # Cover the old 58.7X only in its number area, with a feathered blend.
-    soft_cover((365, 300, 1190, 590), (0, 8, 2, 205), 45)
-    mult = f"{multiplier:.1f}X"
-    f_mult = fit_font(mult, 760, 250, 100)
-    bb = draw.textbbox((0, 0), mult, font=f_mult, stroke_width=4)
-    tw = bb[2] - bb[0]
-    th = bb[3] - bb[1]
-    mx = (W - tw) / 2
-    my = 315
+    # Main multiplier area. The supplied outer artwork remains around this field.
+    draw.rectangle([350,300,1200,590],fill=(0,12,3,245))
+    img=_texture_multiplier(img,f"{multiplier:.1f}X",782,(380,315,1190,575),250)
+    draw=ImageDraw.Draw(img,"RGBA")
 
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow, "RGBA")
-    for sw, alpha in ((24, 55), (16, 80), (9, 115)):
-        gd.text((mx, my), mult, font=f_mult, fill=(100, 190, 40, 255),
-                stroke_width=sw, stroke_fill=(80, 255, 0, alpha))
-    glow = glow.filter(ImageFilter.GaussianBlur(8))
-    img = Image.alpha_composite(img, glow)
-    draw = ImageDraw.Draw(img, "RGBA")
-    draw.text((mx, my), mult, font=f_mult, fill=(100, 190, 40, 255),
-              stroke_width=4, stroke_fill=(205, 255, 55, 255))
+    # Gain value.
+    draw.rectangle([525,585,1000,665],fill=(0,8,2,255))
+    gain=f"{multiplier:.1f}X GAIN"
+    _center(draw,(535,590,990,655),gain,_font_fit(gain,430,45),GREEN)
 
-    # ── GAIN BAR ────────────────────────────────────────────────────────
-    # Keep the template bar and rockets; replace only the sample gain text.
-    soft_cover((535, 595, 995, 665), (0, 8, 2, 185), 12)
-    gain = f"5 8 . 7 X GAIN" if False else f"{multiplier:.1f}X GAIN"
-    center_text((545, 595, 985, 665), gain, fit_font(gain, 390, 48, 24), GREEN)
+    # Bottom left dynamic field.
+    draw.rectangle([330,680,725,850],fill=(0,5,0,255))
+    draw.text((370,705),"CALLED BY",font=_font_fit("CALLED BY",160,30),fill=GREEN)
+    caller=f"@{username}"
+    _center(draw,(350,750,710,825),caller,_font_fit(caller,330,48),WHITE)
 
-    # ── CALLED BY ───────────────────────────────────────────────────────
-    soft_cover((350, 740, 710, 825), (0, 5, 0, 225), 12)
-    caller = f"@{username}"
-    center_text((355, 742, 705, 823), caller, fit_font(caller, 320, 56, 24), WHITE)
+    # Bottom right dynamic field.
+    draw.rectangle([775,680,1140,850],fill=(0,5,0,255))
+    draw.text((835,705),"CURRENT MCAP",font=_font_fit("CURRENT MCAP",230,30),fill=GREEN)
+    mcap=format_mcap(current_mcap)
+    _center(draw,(790,750,1130,825),mcap,_font_fit(mcap,300,50),WHITE)
 
-    # ── CURRENT MCAP ────────────────────────────────────────────────────
-    soft_cover((790, 740, 1130, 825), (0, 5, 0, 225), 12)
-    current = format_mcap(current_mcap)
-    center_text((795, 742, 1125, 823), current, fit_font(current, 300, 58, 24), WHITE)
-
-    out = img.convert("RGB")
-    buf = io.BytesIO()
-    out.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
+    out=img.convert("RGB"); buf=io.BytesIO(); out.save(buf,format="PNG"); buf.seek(0); return buf
 
 # ─────────────────────────────────────────────
 # Token helpers
