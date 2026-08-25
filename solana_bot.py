@@ -1,4 +1,4 @@
-# trigger redeploy v8
+# trigger redeploy v7
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -366,7 +366,7 @@ async def button_handler(update, context):
     elif data == "pnl_menu":
         if not can_pnl:
             await query.message.reply_text(
-                "📊 *PnL Card*\n\n🔒 This feature is available to selected users only.\n\nStay tuned! 🚀",
+                "📊 *PnL Card*\n\nComing Soon! 🚀",
                 parse_mode="Markdown")
             return
         waiting_for_pnl[user.id] = {"step": "address"}
@@ -374,13 +374,7 @@ async def button_handler(update, context):
 
     elif data.startswith("pnl:"):
         if not can_pnl:
-            await query.message.reply_text(
-                "📊 *PnL Card*
-
-🚧 *Coming Soon!*
-
-This feature is currently under development. Stay tuned! 🚀",
-                parse_mode="Markdown")
+            await query.message.reply_text("🔒 *PnL Card is for selected users only.*", parse_mode="Markdown")
             return
         address = data.split(":")[1]
         pair = get_token_info(address)
