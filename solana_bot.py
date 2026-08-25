@@ -551,23 +551,24 @@ def run_web_server():
 # Main
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
+    import time
     print("🤖 ApeRadarX Bot starting...")
+    t = threading.Thread(target=run_web_server)
+    t.daemon = True
+    t.start()
+    print("✅ Web server started!")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("✅ Bot is running with webhook!")
-
-    port = int(os.environ.get("PORT", 10000))
-    webhook_url = "https://solana-bot-fapw.onrender.com/telegram"
-
+    print("✅ Bot is running!")
     app.run_webhook(
         listen="0.0.0.0",
-        port=port,
+        port=int(os.environ.get("PORT", 10000)),
         url_path="telegram",
-        webhook_url=webhook_url,
+        webhook_url="https://solana-bot-fapw.onrender.com/telegram",
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
     )
