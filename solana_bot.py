@@ -553,11 +553,6 @@ def run_web_server():
 if __name__ == "__main__":
     import time
     print("🤖 ApeRadarX Bot starting...")
-    t = threading.Thread(target=run_web_server)
-    t.daemon = True
-    t.start()
-    print("✅ Web server started!")
-
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
