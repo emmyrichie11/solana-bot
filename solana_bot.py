@@ -1,4 +1,4 @@
-# trigger redeploy v4
+# trigger redeploy v5
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -539,13 +539,24 @@ async def handle_message(update, context):
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "25")
         self.end_headers()
         self.wfile.write(b"ApeRadarX Bot is running!")
+        self.wfile.flush()
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
     def log_message(self, format, *args): pass
 
 def run_web_server():
+    import socketserver
     port = int(os.environ.get("PORT", 10000))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
+        print(f"✅ Health server on port {port}")
+        httpd.serve_forever()
 
 # ─────────────────────────────────────────────
 # Main
