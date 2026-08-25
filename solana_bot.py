@@ -558,17 +558,10 @@ if __name__ == "__main__":
     t.start()
     print("✅ Web server started!")
 
-    while True:
-        try:
-            app = ApplicationBuilder().token(BOT_TOKEN).build()
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(CommandHandler("help", help_command))
-            app.add_handler(CallbackQueryHandler(button_handler))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            print("✅ Bot is running!")
-            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-        except Exception as e:
-            print(f"⚠️ Bot error: {e}")
-            print("🔄 Restarting in 10 seconds...")
-            time.sleep(10)
-            continue
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("✅ Bot is running!")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
