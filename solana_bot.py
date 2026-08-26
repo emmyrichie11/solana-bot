@@ -366,7 +366,7 @@ async def button_handler(update, context):
     elif data == "pnl_menu":
         if not can_pnl:
             await query.message.reply_text(
-                "📊 *PnL Card*\n\nComing Soon! 🚀",
+                "📊 *PnL Card*\n\n🔒 This feature is available to selected users only.\n\nStay tuned! 🚀",
                 parse_mode="Markdown")
             return
         waiting_for_pnl[user.id] = {"step": "address"}
@@ -496,7 +496,7 @@ async def handle_message(update, context):
                 multiplier = current_mcap / buy_mcap
                 await update.message.reply_photo(
                     photo=card,
-                    caption=f"📊 *{symbol}* | *{multiplier:.1f}X GAIN* 🚀\nPowered by @ApeRadarX",
+                    caption=f"📊 *{symbol}* | *{multiplier:.1f}X GAIN* 🚀\nPowered by @ApeRadarXBot",
                     parse_mode="Markdown")
                 await notify_admin(context, user, f"📊 PnL card: {symbol} {multiplier:.1f}X")
             except Exception as e:
@@ -553,17 +553,15 @@ def run_web_server():
 if __name__ == "__main__":
     import time
     print("🤖 ApeRadarX Bot starting...")
+    t = threading.Thread(target=run_web_server)
+    t.daemon = True
+    t.start()
+    print("✅ Web server started!")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ Bot is running!")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000)),
-        url_path="telegram",
-        webhook_url="https://solana-bot-fapw.onrender.com/telegram",
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
