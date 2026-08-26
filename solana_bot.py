@@ -548,38 +548,29 @@ def run_web_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    import time
     print("🤖 ApeRadarX Bot starting...")
-    t = threading.Thread(target=run_web_server)
-    t.daemon = True
-    t.start()
-    print("✅ Web server started!")
 
-    while True:
-        try:
-            app = ApplicationBuilder().token(BOT_TOKEN).build()
-            app.add_handler(CommandHandler("start", start))
-            app.add_handler(CommandHandler("help", help_command))
-            app.add_handler(CallbackQueryHandler(button_handler))
-            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-            port = int(os.environ.get("PORT", 10000))
-            external_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-            webhook_path = "telegram"
-            webhook_url = f"{external_url}/{webhook_path}" if external_url else None
-            print("✅ Bot is running with webhook!")
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path=webhook_path,
-                webhook_url=webhook_url,
-                drop_pending_updates=True,
-                allowed_updates=Update.ALL_TYPES
-            )
-        except Exception as e:
-            print(f"⚠️ Bot error: {e}")
-            print("🔄 Restarting in 10 seconds...")
-            time.sleep(10)
-            continue
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    port = int(os.environ.get("PORT", 10000))
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://solana-bot-fapw.onrender.com").rstrip("/")
+    webhook_path = "telegram-webhook"
+    webhook_url = f"{render_url}/{webhook_path}"
+
+    print("✅ Bot is running with webhook!")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=webhook_path,
+        webhook_url=webhook_url,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
