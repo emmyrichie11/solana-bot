@@ -223,107 +223,98 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 # Token helpers
 # ─────────────────────────────────────────────
-def clean_token_address(text):
-    """Extract a Solana base58 contract address from pasted text."""
+def normalize_token_address(text):
+    """Extract a Solana mint address from normal Telegram paste/URL formatting."""
     if not text:
         return None
 
-    text = text.strip()
+    # Remove invisible Unicode characters that can be introduced by copying.
+    text = (
+        text.replace("\u200b", "")
+            .replace("\u200c", "")
+            .replace("\u200d", "")
+            .replace("\ufeff", "")
+            .strip()
+    )
 
-    # Remove common formatting people accidentally paste with a CA.
-    text = text.replace("`", "").replace("\u200b", "").strip()
+    # If a DexScreener/Solana explorer URL was pasted, keep only the address.
+    m = re.search(r"([1-9A-HJ-NP-Za-km-z]{32,44})(?:[^1-9A-HJ-NP-Za-km-z]|$)", text)
+    if m:
+        address = m.group(1)
+        if 32 <= len(address) <= 44:
+            return address
 
-    # If a full Solscan/DexScreener-style URL is pasted, extract the address.
-    match = re.search(r"([1-9A-HJ-NP-Za-km-z]{32,44})", text)
-    if not match:
-        return None
+    # Plain contract address.
+    text = text.strip("`'\"()[]<> ")
+    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", text):
+        return text
 
-    address = match.group(1)
-
-    # Solana base58 does not contain 0, O, I or l.
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
-        return None
-
-    return address
+    return None
 
 
 def get_token_info(address):
-    """Fetch token data reliably from DexScreener."""
-    address = clean_token_address(address)
+    """Fetch the best Solana pair for a token mint.
+
+    DexScreener's current chain-scoped endpoint returns a JSON LIST, while
+    the older endpoint returned an object containing 'pairs'. Support both
+    formats and keep a couple of fallbacks so a valid CA isn't reported as
+    'Token not found' just because one endpoint has changed.
+    """
+    address = normalize_token_address(address)
     if not address:
         return None
 
     headers = {
-        "User-Agent": "ApeRadarX/1.0",
         "Accept": "application/json",
+        "User-Agent": "ApeRadarX/1.0",
     }
 
-    # Primary lookup.
-    for attempt in range(2):
+    endpoints = [
+        f"https://api.dexscreener.com/tokens/v1/solana/{address}",
+        f"https://api.dexscreener.com/token-pairs/v1/solana/{address}",
+        f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+        f"https://api.dexscreener.com/latest/dex/search?q={address}",
+    ]
+
+    for url in endpoints:
         try:
-            res = requests.get(
-                f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-                headers=headers,
-                timeout=15,
-            )
-            res.raise_for_status()
+            res = requests.get(url, headers=headers, timeout=12)
+            if res.status_code != 200:
+                continue
+
             data = res.json()
-            pairs = data.get("pairs") or []
+
+            # Current chain-scoped endpoints return a list.
+            if isinstance(data, list):
+                pairs = data
+            # Legacy/search endpoint returns {"pairs": [...]}
+            elif isinstance(data, dict):
+                pairs = data.get("pairs") or []
+            else:
+                pairs = []
+
+            # Search can return other chains; only accept our Solana mint.
+            pairs = [
+                p for p in pairs
+                if isinstance(p, dict)
+                and p.get("chainId") == "solana"
+                and (
+                    p.get("baseToken", {}).get("address") == address
+                    or p.get("quoteToken", {}).get("address") == address
+                )
+            ]
 
             if pairs:
-                solana_pairs = [
-                    p for p in pairs
-                    if p.get("chainId", "").lower() == "solana"
-                    and (
-                        p.get("baseToken", {}).get("address") == address
-                        or p.get("quoteToken", {}).get("address") == address
-                    )
-                ]
-
-                pairs = solana_pairs or pairs
                 return sorted(
                     pairs,
                     key=lambda p: float(
-                        p.get("liquidity", {}).get("usd", 0) or 0
+                        (p.get("liquidity") or {}).get("usd", 0) or 0
                     ),
                     reverse=True,
                 )[0]
 
-        except (requests.RequestException, ValueError, TypeError, KeyError):
-            if attempt == 0:
-                continue
-
-    # Fallback to DexScreener search when the token endpoint does not return
-    # the token (this helps with newly indexed tokens).
-    try:
-        res = requests.get(
-            "https://api.dexscreener.com/latest/dex/search",
-            params={"q": address},
-            headers=headers,
-            timeout=15,
-        )
-        res.raise_for_status()
-        pairs = res.json().get("pairs") or []
-
-        matches = [
-            p for p in pairs
-            if p.get("chainId", "").lower() == "solana"
-            and (
-                p.get("baseToken", {}).get("address") == address
-                or p.get("quoteToken", {}).get("address") == address
-            )
-        ]
-
-        if matches:
-            return sorted(
-                matches,
-                key=lambda p: float(
-                    p.get("liquidity", {}).get("usd", 0) or 0
-                ),
-                reverse=True,
-            )[0]
-    except (requests.RequestException, ValueError, TypeError, KeyError):
-        pass
+        except (requests.RequestException, ValueError, TypeError, AttributeError):
+            continue
 
     return None
 
@@ -558,7 +549,7 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        address = clean_token_address(text)
+        address = normalize_token_address(text)
         if address:
             await update.message.reply_text("🔍 Fetching token info...")
             pair = get_token_info(address)
@@ -616,7 +607,7 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
         return
 
-    address = clean_token_address(text)
+    address = normalize_token_address(text)
     if address:
         await update.message.reply_text("🔍 Scanning token...")
         pair = get_token_info(address)
