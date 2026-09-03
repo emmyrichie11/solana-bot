@@ -1,4 +1,4 @@
-# trigger redeploy v9
+# trigger redeploy v8
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -22,7 +22,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BOT_NAME = "ApeRadarX"
 ADMIN_ID = 1495066761
-PNL_ALLOWED = {1495066761, 6203945884, 8730420346}
+PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698}
 
 # Background image URL (hosted on GitHub)
 
@@ -224,12 +224,155 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # Token helpers
 # ─────────────────────────────────────────────
 def get_token_info(address):
+    """Fetch real Solana token market data from GeckoTerminal.
+
+    GeckoTerminal is used instead of DexScreener so the bot does not depend
+    on DexScreener being reachable from the Render instance.
+    Returns a DexScreener-shaped pair dict so the rest of the original bot
+    (message formatting, buttons and PnL card) stays unchanged.
+    """
+    address = (address or "").strip().strip("` ")
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
+        return None
+
+    base_url = "https://api.geckoterminal.com/api/v2"
+    headers = {
+        "Accept": "application/json;version=20230203",
+        "User-Agent": "ApeRadarX/1.0",
+    }
+
     try:
-        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
-        pairs = res.json().get("pairs")
-        if not pairs: return None
-        return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
-    except: return None
+        # Get the token's own metadata first.
+        token_res = requests.get(
+            f"{base_url}/networks/solana/tokens/{address}",
+            headers=headers,
+            timeout=12,
+        )
+        token_data = token_res.json().get("data") if token_res.ok else None
+        token_attrs = (token_data or {}).get("attributes", {})
+
+        # Get all pools for this exact mint. This is the important lookup:
+        # the CA itself is used, rather than a search by symbol/name.
+        pools_res = requests.get(
+            f"{base_url}/networks/solana/tokens/{address}/pools",
+            headers=headers,
+            timeout=12,
+        )
+        if not pools_res.ok:
+            return None
+
+        payload = pools_res.json()
+        pools = payload.get("data") or []
+        if not pools:
+            return None
+
+        def pool_liquidity(pool):
+            attrs = pool.get("attributes") or {}
+            try:
+                return float(attrs.get("reserve_in_usd") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # Prefer the deepest real pool. A pool must have a usable price and
+        # liquidity/market information; otherwise it is not useful for the
+        # bot's market-data/PnL workflow.
+        pools = sorted(pools, key=pool_liquidity, reverse=True)
+        selected = None
+        for pool in pools:
+            attrs = pool.get("attributes") or {}
+            try:
+                price = float(attrs.get("base_token_price_usd") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if price > 0 and pool_liquidity(pool) > 0:
+                selected = pool
+                break
+
+        if selected is None:
+            return None
+
+        attrs = selected.get("attributes") or {}
+        relationships = selected.get("relationships") or {}
+        base_rel = (relationships.get("base_token") or {}).get("data") or {}
+        quote_rel = (relationships.get("quote_token") or {}).get("data") or {}
+
+        base_id = str(base_rel.get("id") or "")
+        quote_id = str(quote_rel.get("id") or "")
+        wanted_id = f"solana_{address}"
+
+        # Normally the requested mint is the base token. If it is the quote,
+        # use the quote price and swap the token resource when available.
+        token_is_base = base_id.lower() == wanted_id.lower() or base_id.lower().endswith(address.lower())
+        token_is_quote = quote_id.lower() == wanted_id.lower() or quote_id.lower().endswith(address.lower())
+
+        if not token_is_base and not token_is_quote:
+            return None
+
+        price_usd = attrs.get("base_token_price_usd") if token_is_base else attrs.get("quote_token_price_usd")
+        try:
+            price_usd = float(price_usd or 0)
+        except (TypeError, ValueError):
+            price_usd = 0.0
+        if price_usd <= 0:
+            return None
+
+        # GeckoTerminal token attributes are the preferred source for name,
+        # symbol and image. Fall back to included resources if necessary.
+        name = token_attrs.get("name") or "Unknown"
+        symbol = token_attrs.get("symbol") or "TOKEN"
+        image_url = token_attrs.get("image_url") or token_attrs.get("imageUrl")
+
+        included = payload.get("included") or []
+        for resource in included:
+            if resource.get("type") != "tokens":
+                continue
+            rid = str(resource.get("id") or "")
+            if rid.lower() == wanted_id.lower() or rid.lower().endswith(address.lower()):
+                ia = resource.get("attributes") or {}
+                name = ia.get("name") or name
+                symbol = ia.get("symbol") or symbol
+                image_url = ia.get("image_url") or ia.get("imageUrl") or image_url
+                break
+
+        # Some GeckoTerminal pool responses expose market cap directly;
+        # otherwise FDV is the closest available valuation for the PnL card.
+        market_cap = attrs.get("market_cap_usd")
+        if market_cap in (None, "", 0, "0"):
+            market_cap = attrs.get("fdv_usd")
+
+        try:
+            market_cap = float(market_cap or 0)
+        except (TypeError, ValueError):
+            market_cap = 0.0
+
+        # Convert GeckoTerminal's pool object into the shape already expected
+        # by the original bot. This keeps all existing UI/PnL code unchanged.
+        pool_address = attrs.get("address") or selected.get("id", "").split("_")[-1]
+        pool_name = attrs.get("name") or f"{symbol} / SOL"
+        dex_name = "GECKOTERMINAL"
+        if " / " in pool_name:
+            dex_name = attrs.get("dex_name") or dex_name
+
+        return {
+            "baseToken": {"name": name, "symbol": symbol, "address": address},
+            "priceUsd": price_usd,
+            "priceChange": {
+                "h1": (attrs.get("price_change_percentage") or {}).get("h1", "N/A"),
+                "h24": (attrs.get("price_change_percentage") or {}).get("h24", "N/A"),
+            },
+            "volume": {
+                "h24": (attrs.get("volume_usd") or {}).get("h24", "N/A"),
+            },
+            "liquidity": {"usd": attrs.get("reserve_in_usd", "N/A")},
+            "marketCap": market_cap,
+            "dexId": dex_name,
+            "url": f"https://www.geckoterminal.com/solana/pools/{pool_address}" if pool_address else "",
+            "info": {"imageUrl": image_url},
+        }
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        return None
+    except Exception:
+        return None
 
 def format_number(n):
     try:
