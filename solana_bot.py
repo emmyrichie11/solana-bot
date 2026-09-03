@@ -223,13 +223,109 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 # Token helpers
 # ─────────────────────────────────────────────
+def clean_token_address(text):
+    """Extract a Solana base58 contract address from pasted text."""
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Remove common formatting people accidentally paste with a CA.
+    text = text.replace("`", "").replace("\u200b", "").strip()
+
+    # If a full Solscan/DexScreener-style URL is pasted, extract the address.
+    match = re.search(r"([1-9A-HJ-NP-Za-km-z]{32,44})", text)
+    if not match:
+        return None
+
+    address = match.group(1)
+
+    # Solana base58 does not contain 0, O, I or l.
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
+        return None
+
+    return address
+
+
 def get_token_info(address):
+    """Fetch token data reliably from DexScreener."""
+    address = clean_token_address(address)
+    if not address:
+        return None
+
+    headers = {
+        "User-Agent": "ApeRadarX/1.0",
+        "Accept": "application/json",
+    }
+
+    # Primary lookup.
+    for attempt in range(2):
+        try:
+            res = requests.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+                headers=headers,
+                timeout=15,
+            )
+            res.raise_for_status()
+            data = res.json()
+            pairs = data.get("pairs") or []
+
+            if pairs:
+                solana_pairs = [
+                    p for p in pairs
+                    if p.get("chainId", "").lower() == "solana"
+                    and (
+                        p.get("baseToken", {}).get("address") == address
+                        or p.get("quoteToken", {}).get("address") == address
+                    )
+                ]
+
+                pairs = solana_pairs or pairs
+                return sorted(
+                    pairs,
+                    key=lambda p: float(
+                        p.get("liquidity", {}).get("usd", 0) or 0
+                    ),
+                    reverse=True,
+                )[0]
+
+        except (requests.RequestException, ValueError, TypeError, KeyError):
+            if attempt == 0:
+                continue
+
+    # Fallback to DexScreener search when the token endpoint does not return
+    # the token (this helps with newly indexed tokens).
     try:
-        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
-        pairs = res.json().get("pairs")
-        if not pairs: return None
-        return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
-    except: return None
+        res = requests.get(
+            "https://api.dexscreener.com/latest/dex/search",
+            params={"q": address},
+            headers=headers,
+            timeout=15,
+        )
+        res.raise_for_status()
+        pairs = res.json().get("pairs") or []
+
+        matches = [
+            p for p in pairs
+            if p.get("chainId", "").lower() == "solana"
+            and (
+                p.get("baseToken", {}).get("address") == address
+                or p.get("quoteToken", {}).get("address") == address
+            )
+        ]
+
+        if matches:
+            return sorted(
+                matches,
+                key=lambda p: float(
+                    p.get("liquidity", {}).get("usd", 0) or 0
+                ),
+                reverse=True,
+            )[0]
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        pass
+
+    return None
 
 def format_number(n):
     try:
@@ -462,16 +558,17 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        if 32 <= len(text) <= 44 and text.isalnum():
+        address = clean_token_address(text)
+        if address:
             await update.message.reply_text("🔍 Fetching token info...")
-            pair = get_token_info(text)
+            pair = get_token_info(address)
             if pair:
                 base_token = pair.get("baseToken", {})
                 name = base_token.get("name", "Unknown")
                 symbol = base_token.get("symbol", "TOKEN")
                 current_mcap = pair.get("marketCap", 0)
                 waiting_for_pnl[user.id] = {
-                    "step": "buy_mcap", "address": text, "name": name, "symbol": symbol,
+                    "step": "buy_mcap", "address": address, "name": name, "symbol": symbol,
                     "current_mcap": float(current_mcap) if current_mcap else 0,
                     "logo_url": pair.get("info",{}).get("imageUrl"),
                 }
@@ -519,18 +616,19 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
         return
 
-    if 32 <= len(text) <= 44 and text.isalnum():
+    address = clean_token_address(text)
+    if address:
         await update.message.reply_text("🔍 Scanning token...")
-        pair = get_token_info(text)
+        pair = get_token_info(address)
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
-            await notify_admin(context, user, f"🔍 Scanned: {symbol}", text)
+            await notify_admin(context, user, f"🔍 Scanned: {symbol}", address)
             await update.message.reply_text(
                 build_token_message(pair), parse_mode="Markdown",
-                reply_markup=token_keyboard(symbol, text),
+                reply_markup=token_keyboard(symbol, address),
                 disable_web_page_preview=True)
         else:
-            await notify_admin(context, user, "❌ Token not found", text)
+            await notify_admin(context, user, "❌ Token not found", address)
             await update.message.reply_text("❌ Token not found. Paste a valid Solana contract address.")
     else:
         await notify_admin(context, user, "💬 Message", text)
