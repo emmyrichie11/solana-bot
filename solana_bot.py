@@ -224,41 +224,79 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # Token helpers
 # ─────────────────────────────────────────────
 def normalize_token_address(text):
-    """Extract a Solana mint address from normal Telegram paste/URL formatting."""
+    """Extract a Solana mint address from a Telegram paste/URL."""
     if not text:
         return None
 
-    # Remove invisible Unicode characters that can be introduced by copying.
-    text = (
-        text.replace("\u200b", "")
-            .replace("\u200c", "")
-            .replace("\u200d", "")
-            .replace("\ufeff", "")
-            .strip()
-    )
+    text = str(text).replace("\u200b", "").replace("\u200c", "") \
+        .replace("\u200d", "").replace("\ufeff", "").strip()
 
-    # If a DexScreener/Solana explorer URL was pasted, keep only the address.
-    m = re.search(r"([1-9A-HJ-NP-Za-km-z]{32,44})(?:[^1-9A-HJ-NP-Za-km-z]|$)", text)
-    if m:
-        address = m.group(1)
-        if 32 <= len(address) <= 44:
-            return address
-
-    # Plain contract address.
+    # Plain CA, or a CA copied from a Solana/DexScreener URL.
     text = text.strip("`'\"()[]<> ")
-    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", text):
-        return text
+    match = re.search(r"([1-9A-HJ-NP-Za-km-z]{32,44})", text)
+    if not match:
+        return None
 
+    address = match.group(1)
+    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
+        return address
+    return None
+
+
+def _choose_best_pair(pairs):
+    if not isinstance(pairs, list):
+        return None
+    valid = [p for p in pairs if isinstance(p, dict)]
+    if not valid:
+        return None
+    return sorted(
+        valid,
+        key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0),
+        reverse=True,
+    )[0]
+
+
+def _rpc_validate_solana_mint(address):
+    """Validate a CA directly on Solana when no market indexer has it yet.
+
+    This is important for newly-created/illiquid tokens: a token can be a
+    perfectly valid Solana SPL/Token-2022 mint before DexScreener has indexed
+    a trading pair for it.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenSupply",
+        "params": [address, {"commitment": "confirmed"}],
+    }
+
+    rpc_urls = [
+        "https://api.mainnet-beta.solana.com",
+        "https://solana-rpc.publicnode.com",
+        "https://rpc.ankr.com/solana",
+    ]
+
+    for rpc_url in rpc_urls:
+        try:
+            res = requests.post(rpc_url, json=payload, timeout=10)
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            value = ((data.get("result") or {}).get("value"))
+            if value is not None and "amount" in value and "decimals" in value:
+                return value
+        except (requests.RequestException, ValueError, TypeError, AttributeError):
+            continue
     return None
 
 
 def get_token_info(address):
-    """Fetch the best Solana pair for a token mint.
+    """Return the best Solana token pair, with an on-chain fallback.
 
-    DexScreener's current chain-scoped endpoint returns a JSON LIST, while
-    the older endpoint returned an object containing 'pairs'. Support both
-    formats and keep a couple of fallbacks so a valid CA isn't reported as
-    'Token not found' just because one endpoint has changed.
+    DexScreener is used first for price/liquidity data. If the token has not
+    been indexed yet, Solana RPC is used to verify that the address is an
+    actual SPL/Token-2022 mint instead of incorrectly reporting "Token not
+    found".
     """
     address = normalize_token_address(address)
     if not address:
@@ -269,52 +307,83 @@ def get_token_info(address):
         "User-Agent": "ApeRadarX/1.0",
     }
 
-    endpoints = [
+    # Direct token endpoint. Do not require a market pair to have every field;
+    # the endpoint itself is scoped to this exact Solana mint.
+    direct_urls = [
         f"https://api.dexscreener.com/tokens/v1/solana/{address}",
-        f"https://api.dexscreener.com/token-pairs/v1/solana/{address}",
         f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-        f"https://api.dexscreener.com/latest/dex/search?q={address}",
     ]
 
-    for url in endpoints:
+    for url in direct_urls:
         try:
             res = requests.get(url, headers=headers, timeout=12)
             if res.status_code != 200:
                 continue
-
             data = res.json()
+            pairs = data if isinstance(data, list) else (data.get("pairs") or []) if isinstance(data, dict) else []
 
-            # Current chain-scoped endpoints return a list.
-            if isinstance(data, list):
-                pairs = data
-            # Legacy/search endpoint returns {"pairs": [...]}
-            elif isinstance(data, dict):
-                pairs = data.get("pairs") or []
-            else:
-                pairs = []
+            # Direct endpoints are already scoped to this mint. Prefer Solana
+            # pairs when chainId is present, but don't reject valid results if
+            # an older response omits chainId.
+            solana_pairs = [
+                p for p in pairs
+                if isinstance(p, dict)
+                and (not p.get("chainId") or p.get("chainId") == "solana")
+            ]
+            pair = _choose_best_pair(solana_pairs)
+            if pair:
+                return pair
+        except (requests.RequestException, ValueError, TypeError, AttributeError):
+            continue
 
-            # Search can return other chains; only accept our Solana mint.
+    # Search endpoint as another indexer fallback. Here we MUST verify the
+    # address is actually one side of the returned Solana pair.
+    try:
+        res = requests.get(
+            f"https://api.dexscreener.com/latest/dex/search?q={address}",
+            headers=headers,
+            timeout=12,
+        )
+        if res.status_code == 200:
+            data = res.json()
+            pairs = data.get("pairs") or [] if isinstance(data, dict) else []
             pairs = [
                 p for p in pairs
                 if isinstance(p, dict)
                 and p.get("chainId") == "solana"
                 and (
-                    p.get("baseToken", {}).get("address") == address
-                    or p.get("quoteToken", {}).get("address") == address
+                    (p.get("baseToken") or {}).get("address") == address
+                    or (p.get("quoteToken") or {}).get("address") == address
                 )
             ]
+            pair = _choose_best_pair(pairs)
+            if pair:
+                return pair
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        pass
 
-            if pairs:
-                return sorted(
-                    pairs,
-                    key=lambda p: float(
-                        (p.get("liquidity") or {}).get("usd", 0) or 0
-                    ),
-                    reverse=True,
-                )[0]
-
-        except (requests.RequestException, ValueError, TypeError, AttributeError):
-            continue
+    # Final fallback: validate the mint directly on Solana. This makes valid
+    # tokens work even when they have no indexed DEX pair yet.
+    supply = _rpc_validate_solana_mint(address)
+    if supply is not None:
+        return {
+            "chainId": "solana",
+            "dexId": "solana",
+            "baseToken": {
+                "address": address,
+                "name": "Solana Token",
+                "symbol": "TOKEN",
+            },
+            "priceUsd": "0",
+            "priceChange": {},
+            "volume": {},
+            "liquidity": {},
+            "marketCap": 0,
+            "fdv": "N/A",
+            "url": f"https://solscan.io/token/{address}",
+            "_onchainOnly": True,
+            "_supply": supply,
+        }
 
     return None
 
@@ -340,7 +409,7 @@ def build_token_message(pair):
     base = pair.get("baseToken", {})
     name = base.get("name","Unknown")
     symbol = base.get("symbol","???")
-    price_usd = pair.get("priceUsd","N/A")
+    price_usd = pair.get("priceUsd")
     h1 = pair.get("priceChange",{}).get("h1","N/A")
     h24 = pair.get("priceChange",{}).get("h24","N/A")
     volume_24h = pair.get("volume",{}).get("h24","N/A")
@@ -351,10 +420,18 @@ def build_token_message(pair):
     def sign(v):
         try: return "🟢 +" if float(v) >= 0 else "🔴 "
         except: return ""
+    if price_usd is not None:
+        try:
+            price_line = f"💵 Price: `${float(price_usd):.8f}`\n"
+        except (TypeError, ValueError):
+            price_line = "💵 Price: `N/A`\n"
+    else:
+        price_line = "💵 Price: `N/A`\n"
+
     msg = (
         f"🪙 *{name}* (${symbol})\n"
         f"━━━━━━━━━━━━━━━━━\n"
-        f"💵 Price: `${float(price_usd):.8f}`\n"
+        f"{price_line}"
         f"📈 1h:  {sign(h1)}{h1}%\n"
         f"📊 24h: {sign(h24)}{h24}%\n"
         f"━━━━━━━━━━━━━━━━━\n"
@@ -363,7 +440,10 @@ def build_token_message(pair):
         f"🏦 Market Cap: {format_number(market_cap)}\n"
         f"🔁 DEX: {dex}\n"
     )
-    if url: msg += f"\n[📎 View on DexScreener]({url})"
+    if pair.get("_onchainOnly"):
+        msg += "\nℹ️ Token verified on Solana. No indexed DEX pair was found yet."
+    elif url:
+        msg += f"\n[📎 View on DexScreener]({url})"
     return msg
 
 def token_keyboard(symbol, address):
