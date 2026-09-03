@@ -224,183 +224,132 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # Token helpers
 # ─────────────────────────────────────────────
 def get_token_info(address):
-    """
-    Fetch the exact Solana token's real market data from GeckoTerminal.
-
-    Returns the same DexScreener-shaped dictionary expected by the original
-    bot and PnL code, so the existing UI/PnL logic stays unchanged.
-    """
+    """Fetch exact Solana token market data from GeckoTerminal."""
     try:
         address = str(address).strip().strip("`").strip()
+        # Solana base58 public keys are normally 32-44 chars.
         if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
             return None
 
+        base = "https://api.geckoterminal.com/api/v2"
         headers = {
             "Accept": "application/json;version=20230203",
-            "User-Agent": "ApeRadarX/1.0",
+            "User-Agent": "Mozilla/5.0",
         }
-        base_url = "https://api.geckoterminal.com/api/v2"
 
-        def get_json(url):
-            response = requests.get(url, headers=headers, timeout=12)
-            response.raise_for_status()
-            return response.json()
+        def get(url):
+            r = requests.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            return r.json()
 
-        def as_float(value, default=0.0):
+        def num(v, default=0.0):
             try:
-                if value is None or value == "":
-                    return default
-                return float(value)
+                return float(v)
             except (TypeError, ValueError):
                 return default
 
-        def nested_value(value, key, default=0.0):
-            if isinstance(value, dict):
-                return value.get(key, default)
-            return default
+        def val(obj, key, default=0):
+            return obj.get(key, default) if isinstance(obj, dict) else default
 
-        # Get metadata for the exact mint.
-        token_json = get_json(
-            f"{base_url}/networks/solana/tokens/{address}"
-        )
-        token_resource = token_json.get("data") or {}
-        token_attr = token_resource.get("attributes") or {}
-
-        # Get pools belonging to the exact mint.
-        pools_json = get_json(
-            f"{base_url}/networks/solana/tokens/{address}/pools"
-        )
+        # Do NOT depend on the token endpoint succeeding. The pool endpoint
+        # is the authoritative check that this CA has a live market.
+        pools_json = get(f"{base}/networks/solana/tokens/{address}/pools")
         pools = pools_json.get("data") or []
         included = pools_json.get("included") or []
 
         if not pools:
             return None
 
-        included_by_id = {
-            item.get("id"): item
-            for item in included
-            if item.get("id")
-        }
+        inc = {x.get("id"): x for x in included if x.get("id")}
 
-        # Select the deepest real pool. Require actual liquidity.
-        best_pool = None
-        best_liquidity = 0.0
+        best = None
+        best_liq = 0.0
 
         for pool in pools:
-            attrs = pool.get("attributes") or {}
-            liquidity = as_float(attrs.get("reserve_in_usd"))
-            if liquidity <= 0:
+            pa = pool.get("attributes") or {}
+            liq = num(pa.get("reserve_in_usd"))
+            if liq <= 0:
                 continue
 
-            relationships = pool.get("relationships") or {}
-            base_rel = ((relationships.get("base_token") or {}).get("data") or {})
-            quote_rel = ((relationships.get("quote_token") or {}).get("data") or {})
-            base_id = base_rel.get("id", "")
-            quote_id = quote_rel.get("id", "")
+            rel = pool.get("relationships") or {}
+            b = (rel.get("base_token") or {}).get("data") or {}
+            q = (rel.get("quote_token") or {}).get("data") or {}
+            bid, qid = b.get("id", ""), q.get("id", "")
 
-            # Extra exact-mint verification.
-            if base_id and quote_id:
-                base_address = base_id.split("_", 1)[-1]
-                quote_address = quote_id.split("_", 1)[-1]
-                if address not in (base_address, quote_address):
+            if bid and qid:
+                ba = bid.split("_", 1)[-1]
+                qa = qid.split("_", 1)[-1]
+                if address != ba and address != qa:
                     continue
 
-            if liquidity > best_liquidity:
-                best_liquidity = liquidity
-                best_pool = pool
+            if liq > best_liq:
+                best, best_liq = pool, liq
 
-        if not best_pool:
+        if not best:
             return None
 
-        pool_attr = best_pool.get("attributes") or {}
-        relationships = best_pool.get("relationships") or {}
+        pa = best.get("attributes") or {}
+        rel = best.get("relationships") or {}
+        b = (rel.get("base_token") or {}).get("data") or {}
+        q = (rel.get("quote_token") or {}).get("data") or {}
+        bid, qid = b.get("id", ""), q.get("id", "")
 
-        base_rel = ((relationships.get("base_token") or {}).get("data") or {})
-        quote_rel = ((relationships.get("quote_token") or {}).get("data") or {})
-        base_id = base_rel.get("id", "")
-        quote_id = quote_rel.get("id", "")
+        battr = (inc.get(bid) or {}).get("attributes") or {}
+        qattr = (inc.get(qid) or {}).get("attributes") or {}
 
-        base_resource = included_by_id.get(base_id) or {}
-        quote_resource = included_by_id.get(quote_id) or {}
-        base_attr = base_resource.get("attributes") or {}
-        quote_attr = quote_resource.get("attributes") or {}
+        is_base = address == bid.split("_", 1)[-1] if bid else True
+        side = battr if is_base else qattr
 
-        if base_id:
-            requested_is_base = address == base_id.split("_", 1)[-1]
-        else:
-            requested_is_base = address != quote_id.split("_", 1)[-1]
+        # Fetch token metadata separately, but don't fail the whole lookup if
+        # that endpoint is unavailable. Pool-included metadata is enough.
+        try:
+            tj = get(f"{base}/networks/solana/tokens/{address}")
+            ta = (tj.get("data") or {}).get("attributes") or {}
+        except Exception:
+            ta = {}
 
-        side_attr = base_attr if requested_is_base else quote_attr
+        name = ta.get("name") or side.get("name") or "Unknown"
+        symbol = ta.get("symbol") or side.get("symbol") or "TOKEN"
 
-        name = (
-            token_attr.get("name")
-            or side_attr.get("name")
-            or "Unknown"
+        price = num(
+            pa.get("base_token_price_usd" if is_base else "quote_token_price_usd")
         )
-        symbol = (
-            token_attr.get("symbol")
-            or side_attr.get("symbol")
-            or "TOKEN"
-        )
-
-        # Use the requested token's price, not the quote token's price.
-        if requested_is_base:
-            price = as_float(pool_attr.get("base_token_price_usd"))
-        else:
-            price = as_float(pool_attr.get("quote_token_price_usd"))
-
         if price <= 0:
-            price = as_float(token_attr.get("price_usd"))
+            price = num(ta.get("price_usd"))
 
-        # Token-level market cap is preferred; pool values are fallbacks.
-        market_cap = as_float(token_attr.get("market_cap_usd"))
+        if price <= 0 or best_liq <= 0:
+            return None
+
+        market_cap = num(ta.get("market_cap_usd"))
         if market_cap <= 0:
-            market_cap = as_float(pool_attr.get("market_cap_usd"))
-
-        # Some tokens have no calculated market cap but do have FDV. Keep the
-        # PnL flow usable without inventing a value.
+            market_cap = num(pa.get("market_cap_usd"))
         if market_cap <= 0:
-            market_cap = as_float(token_attr.get("fdv_usd"))
+            market_cap = num(ta.get("fdv_usd"))
         if market_cap <= 0:
-            market_cap = as_float(pool_attr.get("fdv_usd"))
+            market_cap = num(pa.get("fdv_usd"))
 
-        volume_obj = pool_attr.get("volume_usd")
-        volume_24h = nested_value(volume_obj, "h24", 0)
-        if not volume_24h:
-            volume_24h = as_float(token_attr.get("volume_usd"))
+        volume = val(pa.get("volume_usd"), "h24", 0)
+        if not volume:
+            volume = num(ta.get("volume_usd"))
 
-        price_change = pool_attr.get("price_change_percentage") or {}
-        h1 = nested_value(price_change, "h1", 0)
-        h24 = nested_value(price_change, "h24", 0)
+        changes = pa.get("price_change_percentage") or {}
+        h1 = val(changes, "h1", 0)
+        h24 = val(changes, "h24", 0)
 
-        dex_rel = ((relationships.get("dex") or {}).get("data") or {})
-        dex_resource = included_by_id.get(dex_rel.get("id", "")) or {}
-        dex_attr = dex_resource.get("attributes") or {}
-        dex_name = (
-            dex_attr.get("name")
-            or dex_rel.get("id", "").split("_", 1)[-1]
-            or "N/A"
-        )
+        dex_rel = (rel.get("dex") or {}).get("data") or {}
+        dex_attr = (inc.get(dex_rel.get("id", "")) or {}).get("attributes") or {}
+        dex_name = dex_attr.get("name") or "N/A"
 
-        pool_id = best_pool.get("id", "")
+        pool_id = best.get("id", "")
         pool_address = pool_id.split("_", 1)[-1] if pool_id else ""
         pool_url = (
             f"https://www.geckoterminal.com/solana/pools/{pool_address}"
             if pool_address else ""
         )
 
-        image_url = (
-            token_attr.get("image_url")
-            or side_attr.get("image_url")
-        )
+        image_url = ta.get("image_url") or side.get("image_url")
 
-        # A token is considered found only when there is a real market pool
-        # and usable price + liquidity. This prevents fake TOKEN/$0 results.
-        if price <= 0 or best_liquidity <= 0:
-            return None
-
-        # Normalize GeckoTerminal data to the exact structure used by the
-        # original bot, including its existing PnL generator.
+        # Return the exact shape the ORIGINAL bot/PnL expects.
         return {
             "baseToken": {
                 "name": str(name),
@@ -408,24 +357,14 @@ def get_token_info(address):
                 "address": address,
             },
             "priceUsd": str(price),
-            "priceChange": {
-                "h1": h1,
-                "h24": h24,
-            },
-            "volume": {
-                "h24": volume_24h,
-            },
-            "liquidity": {
-                "usd": best_liquidity,
-            },
+            "priceChange": {"h1": h1, "h24": h24},
+            "volume": {"h24": volume},
+            "liquidity": {"usd": best_liq},
             "marketCap": market_cap,
             "dexId": str(dex_name),
             "url": pool_url,
-            "info": {
-                "imageUrl": image_url,
-            },
+            "info": {"imageUrl": image_url},
         }
-
     except Exception:
         return None
 
