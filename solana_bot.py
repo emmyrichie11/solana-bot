@@ -257,12 +257,7 @@ def _choose_best_pair(pairs):
 
 
 def _rpc_validate_solana_mint(address):
-    """Validate a CA directly on Solana when no market indexer has it yet.
-
-    This is important for newly-created/illiquid tokens: a token can be a
-    perfectly valid Solana SPL/Token-2022 mint before DexScreener has indexed
-    a trading pair for it.
-    """
+    """Validate that an address is an actual Solana token mint."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -290,13 +285,156 @@ def _rpc_validate_solana_mint(address):
     return None
 
 
-def get_token_info(address):
-    """Return the best Solana token pair, with an on-chain fallback.
+def _get_gecko_token_info(address, headers):
+    """Get token metadata from GeckoTerminal by exact Solana mint."""
+    try:
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}"
+        res = requests.get(
+            url,
+            headers={
+                **headers,
+                "Accept": "application/json;version=20230302",
+            },
+            timeout=12,
+        )
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        token = data.get("data") if isinstance(data, dict) else None
+        attrs = token.get("attributes", {}) if isinstance(token, dict) else {}
+        if not attrs:
+            return None
 
-    DexScreener is used first for price/liquidity data. If the token has not
-    been indexed yet, Solana RPC is used to verify that the address is an
-    actual SPL/Token-2022 mint instead of incorrectly reporting "Token not
-    found".
+        return {
+            "name": attrs.get("name") or "Unknown",
+            "symbol": attrs.get("symbol") or "???",
+            "priceUsd": attrs.get("price_usd"),
+            "marketCap": attrs.get("market_cap_usd"),
+            "fdv": attrs.get("fdv_usd"),
+            "volume24": (attrs.get("volume_usd") or {}).get("h24"),
+            "liquidity": attrs.get("total_reserve_in_usd"),
+            "imageUrl": attrs.get("image_url"),
+        }
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _get_gecko_token_pair(address, headers):
+    """Find the most liquid Solana DEX pool for an exact token mint."""
+    try:
+        url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools"
+        res = requests.get(
+            url,
+            headers={
+                **headers,
+                "Accept": "application/json;version=20230302",
+            },
+            timeout=12,
+        )
+        if res.status_code != 200:
+            return None
+
+        payload = res.json()
+        pool_items = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(pool_items, list) or not pool_items:
+            return None
+
+        # Highest-liquidity pool is the safest default.
+        def liquidity(pool):
+            try:
+                return float((pool.get("attributes") or {}).get("reserve_in_usd") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        pool = max(
+            [p for p in pool_items if isinstance(p, dict)],
+            key=liquidity,
+            default=None,
+        )
+        if not pool:
+            return None
+
+        attrs = pool.get("attributes") or {}
+        rel = pool.get("relationships") or {}
+
+        # GeckoTerminal identifies pool tokens through relationship IDs.
+        def rel_address(key):
+            item = ((rel.get(key) or {}).get("data") or {})
+            rid = item.get("id", "")
+            return rid.split("_", 1)[1] if "_" in rid else ""
+
+        base_address = rel_address("base_token")
+        quote_address = rel_address("quote_token")
+
+        # If the queried mint is the quote side, Gecko's pool price fields
+        # describe the base token, so don't use them as the queried token price.
+        token_data = _get_gecko_token_info(address, headers)
+        name = (token_data or {}).get("name") or "Unknown"
+        symbol = (token_data or {}).get("symbol") or "???"
+
+        price = (token_data or {}).get("priceUsd")
+        market_cap = (token_data or {}).get("marketCap")
+        fdv = (token_data or {}).get("fdv")
+        volume24 = (token_data or {}).get("volume24")
+        liquidity_usd = attrs.get("reserve_in_usd")
+
+        # For the common case where the queried token is the pool base token,
+        # use the pool's fresh price/change/volume values.
+        if base_address == address or not base_address:
+            price = attrs.get("base_token_price_usd") or price
+            change = attrs.get("price_change_percentage") or {}
+            volume = attrs.get("volume_usd") or {}
+        else:
+            # Query token endpoint is the authoritative token price when the
+            # token is the quote side.
+            change = {}
+            volume = {"h24": volume24}
+
+        dex_name = "geckoterminal"
+        dex_rel = ((rel.get("dex") or {}).get("data") or {})
+        if dex_rel.get("id"):
+            dex_name = str(dex_rel["id"])
+
+        pool_address = attrs.get("address") or ""
+        pool_url = (
+            f"https://www.geckoterminal.com/solana/pools/{pool_address}"
+            if pool_address else ""
+        )
+
+        return {
+            "chainId": "solana",
+            "dexId": dex_name,
+            "baseToken": {
+                "address": address,
+                "name": name,
+                "symbol": symbol,
+            },
+            "priceUsd": price,
+            "priceChange": {
+                "h1": change.get("h1", "N/A"),
+                "h24": change.get("h24", "N/A"),
+            },
+            "volume": {
+                "h24": volume.get("h24", volume24 if volume24 is not None else "N/A"),
+            },
+            "liquidity": {"usd": liquidity_usd},
+            "marketCap": market_cap,
+            "fdv": fdv,
+            "url": pool_url,
+            "_gecko": True,
+            "_logoUrl": (token_data or {}).get("imageUrl"),
+        }
+    except (requests.RequestException, ValueError, TypeError, AttributeError):
+        return None
+
+
+def get_token_info(address):
+    """Look up a Solana token by its exact mint address.
+
+    DexScreener remains the primary source. GeckoTerminal is used as a
+    second market-data source when DexScreener has not indexed the token.
+    Solana RPC is used only as the final validity check, so valid but
+    unlisted mints are not confused with market-data failures.
     """
     address = normalize_token_address(address)
     if not address:
@@ -307,8 +445,6 @@ def get_token_info(address):
         "User-Agent": "ApeRadarX/1.0",
     }
 
-    # Direct token endpoint. Do not require a market pair to have every field;
-    # the endpoint itself is scoped to this exact Solana mint.
     direct_urls = [
         f"https://api.dexscreener.com/tokens/v1/solana/{address}",
         f"https://api.dexscreener.com/latest/dex/tokens/{address}",
@@ -320,15 +456,18 @@ def get_token_info(address):
             if res.status_code != 200:
                 continue
             data = res.json()
-            pairs = data if isinstance(data, list) else (data.get("pairs") or []) if isinstance(data, dict) else []
+            pairs = data if isinstance(data, list) else (
+                data.get("pairs") or [] if isinstance(data, dict) else []
+            )
 
-            # Direct endpoints are already scoped to this mint. Prefer Solana
-            # pairs when chainId is present, but don't reject valid results if
-            # an older response omits chainId.
             solana_pairs = [
                 p for p in pairs
                 if isinstance(p, dict)
                 and (not p.get("chainId") or p.get("chainId") == "solana")
+                and (
+                    (p.get("baseToken") or {}).get("address") == address
+                    or (p.get("quoteToken") or {}).get("address") == address
+                )
             ]
             pair = _choose_best_pair(solana_pairs)
             if pair:
@@ -336,8 +475,7 @@ def get_token_info(address):
         except (requests.RequestException, ValueError, TypeError, AttributeError):
             continue
 
-    # Search endpoint as another indexer fallback. Here we MUST verify the
-    # address is actually one side of the returned Solana pair.
+    # DexScreener search fallback.
     try:
         res = requests.get(
             f"https://api.dexscreener.com/latest/dex/search?q={address}",
@@ -362,27 +500,36 @@ def get_token_info(address):
     except (requests.RequestException, ValueError, TypeError, AttributeError):
         pass
 
-    # Final fallback: validate the mint directly on Solana. This makes valid
-    # tokens work even when they have no indexed DEX pair yet.
+    # Second market-data source. This is the important part for tokens that
+    # are tradable on Solana but are missing from DexScreener's index.
+    gecko_pair = _get_gecko_token_pair(address, headers)
+    if gecko_pair:
+        return gecko_pair
+
+    # Last resort: only verify the mint. Do NOT fabricate market data.
+    # This branch is intentionally marked on-chain-only so the UI can clearly
+    # distinguish "valid mint, no indexed market" from a priced token.
     supply = _rpc_validate_solana_mint(address)
     if supply is not None:
+        token_meta = _get_gecko_token_info(address, headers)
         return {
             "chainId": "solana",
             "dexId": "solana",
             "baseToken": {
                 "address": address,
-                "name": "Solana Token",
-                "symbol": "TOKEN",
+                "name": (token_meta or {}).get("name") or "Solana Token",
+                "symbol": (token_meta or {}).get("symbol") or "TOKEN",
             },
-            "priceUsd": "0",
+            "priceUsd": (token_meta or {}).get("priceUsd"),
             "priceChange": {},
             "volume": {},
-            "liquidity": {},
-            "marketCap": 0,
-            "fdv": "N/A",
+            "liquidity": {"usd": (token_meta or {}).get("liquidity")},
+            "marketCap": (token_meta or {}).get("marketCap"),
+            "fdv": (token_meta or {}).get("fdv"),
             "url": f"https://solscan.io/token/{address}",
             "_onchainOnly": True,
             "_supply": supply,
+            "_logoUrl": (token_meta or {}).get("imageUrl"),
         }
 
     return None
