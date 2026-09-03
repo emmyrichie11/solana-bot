@@ -224,155 +224,211 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # Token helpers
 # ─────────────────────────────────────────────
 def get_token_info(address):
-    """Fetch real Solana token market data from GeckoTerminal.
-
-    GeckoTerminal is used instead of DexScreener so the bot does not depend
-    on DexScreener being reachable from the Render instance.
-    Returns a DexScreener-shaped pair dict so the rest of the original bot
-    (message formatting, buttons and PnL card) stays unchanged.
     """
-    address = (address or "").strip().strip("` ")
-    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
-        return None
+    Fetch the exact Solana token's real market data from GeckoTerminal.
 
-    base_url = "https://api.geckoterminal.com/api/v2"
-    headers = {
-        "Accept": "application/json;version=20230203",
-        "User-Agent": "ApeRadarX/1.0",
-    }
-
+    Returns the same DexScreener-shaped dictionary expected by the original
+    bot and PnL code, so the existing UI/PnL logic stays unchanged.
+    """
     try:
-        # Get the token's own metadata first.
-        token_res = requests.get(
-            f"{base_url}/networks/solana/tokens/{address}",
-            headers=headers,
-            timeout=12,
-        )
-        token_data = token_res.json().get("data") if token_res.ok else None
-        token_attrs = (token_data or {}).get("attributes", {})
-
-        # Get all pools for this exact mint. This is the important lookup:
-        # the CA itself is used, rather than a search by symbol/name.
-        pools_res = requests.get(
-            f"{base_url}/networks/solana/tokens/{address}/pools",
-            headers=headers,
-            timeout=12,
-        )
-        if not pools_res.ok:
+        address = str(address).strip().strip("`").strip()
+        if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
             return None
 
-        payload = pools_res.json()
-        pools = payload.get("data") or []
+        headers = {
+            "Accept": "application/json;version=20230203",
+            "User-Agent": "ApeRadarX/1.0",
+        }
+        base_url = "https://api.geckoterminal.com/api/v2"
+
+        def get_json(url):
+            response = requests.get(url, headers=headers, timeout=12)
+            response.raise_for_status()
+            return response.json()
+
+        def as_float(value, default=0.0):
+            try:
+                if value is None or value == "":
+                    return default
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def nested_value(value, key, default=0.0):
+            if isinstance(value, dict):
+                return value.get(key, default)
+            return default
+
+        # Get metadata for the exact mint.
+        token_json = get_json(
+            f"{base_url}/networks/solana/tokens/{address}"
+        )
+        token_resource = token_json.get("data") or {}
+        token_attr = token_resource.get("attributes") or {}
+
+        # Get pools belonging to the exact mint.
+        pools_json = get_json(
+            f"{base_url}/networks/solana/tokens/{address}/pools"
+        )
+        pools = pools_json.get("data") or []
+        included = pools_json.get("included") or []
+
         if not pools:
             return None
 
-        def pool_liquidity(pool):
-            attrs = pool.get("attributes") or {}
-            try:
-                return float(attrs.get("reserve_in_usd") or 0)
-            except (TypeError, ValueError):
-                return 0.0
+        included_by_id = {
+            item.get("id"): item
+            for item in included
+            if item.get("id")
+        }
 
-        # Prefer the deepest real pool. A pool must have a usable price and
-        # liquidity/market information; otherwise it is not useful for the
-        # bot's market-data/PnL workflow.
-        pools = sorted(pools, key=pool_liquidity, reverse=True)
-        selected = None
+        # Select the deepest real pool. Require actual liquidity.
+        best_pool = None
+        best_liquidity = 0.0
+
         for pool in pools:
             attrs = pool.get("attributes") or {}
-            try:
-                price = float(attrs.get("base_token_price_usd") or 0)
-            except (TypeError, ValueError):
-                price = 0.0
-            if price > 0 and pool_liquidity(pool) > 0:
-                selected = pool
-                break
-
-        if selected is None:
-            return None
-
-        attrs = selected.get("attributes") or {}
-        relationships = selected.get("relationships") or {}
-        base_rel = (relationships.get("base_token") or {}).get("data") or {}
-        quote_rel = (relationships.get("quote_token") or {}).get("data") or {}
-
-        base_id = str(base_rel.get("id") or "")
-        quote_id = str(quote_rel.get("id") or "")
-        wanted_id = f"solana_{address}"
-
-        # Normally the requested mint is the base token. If it is the quote,
-        # use the quote price and swap the token resource when available.
-        token_is_base = base_id.lower() == wanted_id.lower() or base_id.lower().endswith(address.lower())
-        token_is_quote = quote_id.lower() == wanted_id.lower() or quote_id.lower().endswith(address.lower())
-
-        if not token_is_base and not token_is_quote:
-            return None
-
-        price_usd = attrs.get("base_token_price_usd") if token_is_base else attrs.get("quote_token_price_usd")
-        try:
-            price_usd = float(price_usd or 0)
-        except (TypeError, ValueError):
-            price_usd = 0.0
-        if price_usd <= 0:
-            return None
-
-        # GeckoTerminal token attributes are the preferred source for name,
-        # symbol and image. Fall back to included resources if necessary.
-        name = token_attrs.get("name") or "Unknown"
-        symbol = token_attrs.get("symbol") or "TOKEN"
-        image_url = token_attrs.get("image_url") or token_attrs.get("imageUrl")
-
-        included = payload.get("included") or []
-        for resource in included:
-            if resource.get("type") != "tokens":
+            liquidity = as_float(attrs.get("reserve_in_usd"))
+            if liquidity <= 0:
                 continue
-            rid = str(resource.get("id") or "")
-            if rid.lower() == wanted_id.lower() or rid.lower().endswith(address.lower()):
-                ia = resource.get("attributes") or {}
-                name = ia.get("name") or name
-                symbol = ia.get("symbol") or symbol
-                image_url = ia.get("image_url") or ia.get("imageUrl") or image_url
-                break
 
-        # Some GeckoTerminal pool responses expose market cap directly;
-        # otherwise FDV is the closest available valuation for the PnL card.
-        market_cap = attrs.get("market_cap_usd")
-        if market_cap in (None, "", 0, "0"):
-            market_cap = attrs.get("fdv_usd")
+            relationships = pool.get("relationships") or {}
+            base_rel = ((relationships.get("base_token") or {}).get("data") or {})
+            quote_rel = ((relationships.get("quote_token") or {}).get("data") or {})
+            base_id = base_rel.get("id", "")
+            quote_id = quote_rel.get("id", "")
 
-        try:
-            market_cap = float(market_cap or 0)
-        except (TypeError, ValueError):
-            market_cap = 0.0
+            # Extra exact-mint verification.
+            if base_id and quote_id:
+                base_address = base_id.split("_", 1)[-1]
+                quote_address = quote_id.split("_", 1)[-1]
+                if address not in (base_address, quote_address):
+                    continue
 
-        # Convert GeckoTerminal's pool object into the shape already expected
-        # by the original bot. This keeps all existing UI/PnL code unchanged.
-        pool_address = attrs.get("address") or selected.get("id", "").split("_")[-1]
-        pool_name = attrs.get("name") or f"{symbol} / SOL"
-        dex_name = "GECKOTERMINAL"
-        if " / " in pool_name:
-            dex_name = attrs.get("dex_name") or dex_name
+            if liquidity > best_liquidity:
+                best_liquidity = liquidity
+                best_pool = pool
 
+        if not best_pool:
+            return None
+
+        pool_attr = best_pool.get("attributes") or {}
+        relationships = best_pool.get("relationships") or {}
+
+        base_rel = ((relationships.get("base_token") or {}).get("data") or {})
+        quote_rel = ((relationships.get("quote_token") or {}).get("data") or {})
+        base_id = base_rel.get("id", "")
+        quote_id = quote_rel.get("id", "")
+
+        base_resource = included_by_id.get(base_id) or {}
+        quote_resource = included_by_id.get(quote_id) or {}
+        base_attr = base_resource.get("attributes") or {}
+        quote_attr = quote_resource.get("attributes") or {}
+
+        if base_id:
+            requested_is_base = address == base_id.split("_", 1)[-1]
+        else:
+            requested_is_base = address != quote_id.split("_", 1)[-1]
+
+        side_attr = base_attr if requested_is_base else quote_attr
+
+        name = (
+            token_attr.get("name")
+            or side_attr.get("name")
+            or "Unknown"
+        )
+        symbol = (
+            token_attr.get("symbol")
+            or side_attr.get("symbol")
+            or "TOKEN"
+        )
+
+        # Use the requested token's price, not the quote token's price.
+        if requested_is_base:
+            price = as_float(pool_attr.get("base_token_price_usd"))
+        else:
+            price = as_float(pool_attr.get("quote_token_price_usd"))
+
+        if price <= 0:
+            price = as_float(token_attr.get("price_usd"))
+
+        # Token-level market cap is preferred; pool values are fallbacks.
+        market_cap = as_float(token_attr.get("market_cap_usd"))
+        if market_cap <= 0:
+            market_cap = as_float(pool_attr.get("market_cap_usd"))
+
+        # Some tokens have no calculated market cap but do have FDV. Keep the
+        # PnL flow usable without inventing a value.
+        if market_cap <= 0:
+            market_cap = as_float(token_attr.get("fdv_usd"))
+        if market_cap <= 0:
+            market_cap = as_float(pool_attr.get("fdv_usd"))
+
+        volume_obj = pool_attr.get("volume_usd")
+        volume_24h = nested_value(volume_obj, "h24", 0)
+        if not volume_24h:
+            volume_24h = as_float(token_attr.get("volume_usd"))
+
+        price_change = pool_attr.get("price_change_percentage") or {}
+        h1 = nested_value(price_change, "h1", 0)
+        h24 = nested_value(price_change, "h24", 0)
+
+        dex_rel = ((relationships.get("dex") or {}).get("data") or {})
+        dex_resource = included_by_id.get(dex_rel.get("id", "")) or {}
+        dex_attr = dex_resource.get("attributes") or {}
+        dex_name = (
+            dex_attr.get("name")
+            or dex_rel.get("id", "").split("_", 1)[-1]
+            or "N/A"
+        )
+
+        pool_id = best_pool.get("id", "")
+        pool_address = pool_id.split("_", 1)[-1] if pool_id else ""
+        pool_url = (
+            f"https://www.geckoterminal.com/solana/pools/{pool_address}"
+            if pool_address else ""
+        )
+
+        image_url = (
+            token_attr.get("image_url")
+            or side_attr.get("image_url")
+        )
+
+        # A token is considered found only when there is a real market pool
+        # and usable price + liquidity. This prevents fake TOKEN/$0 results.
+        if price <= 0 or best_liquidity <= 0:
+            return None
+
+        # Normalize GeckoTerminal data to the exact structure used by the
+        # original bot, including its existing PnL generator.
         return {
-            "baseToken": {"name": name, "symbol": symbol, "address": address},
-            "priceUsd": price_usd,
+            "baseToken": {
+                "name": str(name),
+                "symbol": str(symbol),
+                "address": address,
+            },
+            "priceUsd": str(price),
             "priceChange": {
-                "h1": (attrs.get("price_change_percentage") or {}).get("h1", "N/A"),
-                "h24": (attrs.get("price_change_percentage") or {}).get("h24", "N/A"),
+                "h1": h1,
+                "h24": h24,
             },
             "volume": {
-                "h24": (attrs.get("volume_usd") or {}).get("h24", "N/A"),
+                "h24": volume_24h,
             },
-            "liquidity": {"usd": attrs.get("reserve_in_usd", "N/A")},
+            "liquidity": {
+                "usd": best_liquidity,
+            },
             "marketCap": market_cap,
-            "dexId": dex_name,
-            "url": f"https://www.geckoterminal.com/solana/pools/{pool_address}" if pool_address else "",
-            "info": {"imageUrl": image_url},
+            "dexId": str(dex_name),
+            "url": pool_url,
+            "info": {
+                "imageUrl": image_url,
+            },
         }
-    except (requests.RequestException, ValueError, TypeError, KeyError):
-        return None
+
     except Exception:
         return None
+
 
 def format_number(n):
     try:
