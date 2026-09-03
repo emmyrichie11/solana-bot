@@ -1,4 +1,4 @@
-# trigger redeploy v8
+# trigger redeploy v9
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -225,14 +225,8 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 def get_token_info(address):
     try:
-        # Try tokens endpoint first
         res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
-        data = res.json()
-        pairs = data.get("pairs")
-        if not pairs:
-            # Try search endpoint as fallback
-            res2 = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={address}", timeout=10)
-            pairs = res2.json().get("pairs")
+        pairs = res.json().get("pairs")
         if not pairs: return None
         return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
     except: return None
@@ -468,7 +462,7 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        if 30 <= len(text) <= 50 and re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', text):
+        if 32 <= len(text) <= 44 and text.isalnum():
             await update.message.reply_text("🔍 Fetching token info...")
             pair = get_token_info(text)
             if pair:
@@ -525,7 +519,7 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
         return
 
-    if 30 <= len(text) <= 50 and re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', text):
+    if 32 <= len(text) <= 44 and text.isalnum():
         await update.message.reply_text("🔍 Scanning token...")
         pair = get_token_info(text)
         if pair:
