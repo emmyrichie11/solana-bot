@@ -223,316 +223,13 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 # Token helpers
 # ─────────────────────────────────────────────
-def normalize_token_address(text):
-    """Extract a Solana mint address from a Telegram paste/URL."""
-    if not text:
-        return None
-
-    text = str(text).replace("\u200b", "").replace("\u200c", "") \
-        .replace("\u200d", "").replace("\ufeff", "").strip()
-
-    # Plain CA, or a CA copied from a Solana/DexScreener URL.
-    text = text.strip("`'\"()[]<> ")
-    match = re.search(r"([1-9A-HJ-NP-Za-km-z]{32,44})", text)
-    if not match:
-        return None
-
-    address = match.group(1)
-    if re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address):
-        return address
-    return None
-
-
-def _choose_best_pair(pairs):
-    if not isinstance(pairs, list):
-        return None
-    valid = [p for p in pairs if isinstance(p, dict)]
-    if not valid:
-        return None
-    return sorted(
-        valid,
-        key=lambda p: float((p.get("liquidity") or {}).get("usd", 0) or 0),
-        reverse=True,
-    )[0]
-
-
-def _rpc_validate_solana_mint(address):
-    """Validate that an address is an actual Solana token mint."""
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTokenSupply",
-        "params": [address, {"commitment": "confirmed"}],
-    }
-
-    rpc_urls = [
-        "https://api.mainnet-beta.solana.com",
-        "https://solana-rpc.publicnode.com",
-        "https://rpc.ankr.com/solana",
-    ]
-
-    for rpc_url in rpc_urls:
-        try:
-            res = requests.post(rpc_url, json=payload, timeout=10)
-            if res.status_code != 200:
-                continue
-            data = res.json()
-            value = ((data.get("result") or {}).get("value"))
-            if value is not None and "amount" in value and "decimals" in value:
-                return value
-        except (requests.RequestException, ValueError, TypeError, AttributeError):
-            continue
-    return None
-
-
-def _get_gecko_token_info(address, headers):
-    """Get token metadata from GeckoTerminal by exact Solana mint."""
-    try:
-        url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}"
-        res = requests.get(
-            url,
-            headers={
-                **headers,
-                "Accept": "application/json;version=20230302",
-            },
-            timeout=12,
-        )
-        if res.status_code != 200:
-            return None
-        data = res.json()
-        token = data.get("data") if isinstance(data, dict) else None
-        attrs = token.get("attributes", {}) if isinstance(token, dict) else {}
-        if not attrs:
-            return None
-
-        return {
-            "name": attrs.get("name") or "Unknown",
-            "symbol": attrs.get("symbol") or "???",
-            "priceUsd": attrs.get("price_usd"),
-            "marketCap": attrs.get("market_cap_usd"),
-            "fdv": attrs.get("fdv_usd"),
-            "volume24": (attrs.get("volume_usd") or {}).get("h24"),
-            "liquidity": attrs.get("total_reserve_in_usd"),
-            "imageUrl": attrs.get("image_url"),
-        }
-    except (requests.RequestException, ValueError, TypeError, AttributeError):
-        return None
-
-
-def _get_gecko_token_pair(address, headers):
-    """Find the most liquid Solana DEX pool for an exact token mint."""
-    try:
-        url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools"
-        res = requests.get(
-            url,
-            headers={
-                **headers,
-                "Accept": "application/json;version=20230302",
-            },
-            timeout=12,
-        )
-        if res.status_code != 200:
-            return None
-
-        payload = res.json()
-        pool_items = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(pool_items, list) or not pool_items:
-            return None
-
-        # Highest-liquidity pool is the safest default.
-        def liquidity(pool):
-            try:
-                return float((pool.get("attributes") or {}).get("reserve_in_usd") or 0)
-            except (TypeError, ValueError):
-                return 0
-
-        pool = max(
-            [p for p in pool_items if isinstance(p, dict)],
-            key=liquidity,
-            default=None,
-        )
-        if not pool:
-            return None
-
-        attrs = pool.get("attributes") or {}
-        rel = pool.get("relationships") or {}
-
-        # GeckoTerminal identifies pool tokens through relationship IDs.
-        def rel_address(key):
-            item = ((rel.get(key) or {}).get("data") or {})
-            rid = item.get("id", "")
-            return rid.split("_", 1)[1] if "_" in rid else ""
-
-        base_address = rel_address("base_token")
-        quote_address = rel_address("quote_token")
-
-        # If the queried mint is the quote side, Gecko's pool price fields
-        # describe the base token, so don't use them as the queried token price.
-        token_data = _get_gecko_token_info(address, headers)
-        name = (token_data or {}).get("name") or "Unknown"
-        symbol = (token_data or {}).get("symbol") or "???"
-
-        price = (token_data or {}).get("priceUsd")
-        market_cap = (token_data or {}).get("marketCap")
-        fdv = (token_data or {}).get("fdv")
-        volume24 = (token_data or {}).get("volume24")
-        liquidity_usd = attrs.get("reserve_in_usd")
-
-        # For the common case where the queried token is the pool base token,
-        # use the pool's fresh price/change/volume values.
-        if base_address == address or not base_address:
-            price = attrs.get("base_token_price_usd") or price
-            change = attrs.get("price_change_percentage") or {}
-            volume = attrs.get("volume_usd") or {}
-        else:
-            # Query token endpoint is the authoritative token price when the
-            # token is the quote side.
-            change = {}
-            volume = {"h24": volume24}
-
-        dex_name = "geckoterminal"
-        dex_rel = ((rel.get("dex") or {}).get("data") or {})
-        if dex_rel.get("id"):
-            dex_name = str(dex_rel["id"])
-
-        pool_address = attrs.get("address") or ""
-        pool_url = (
-            f"https://www.geckoterminal.com/solana/pools/{pool_address}"
-            if pool_address else ""
-        )
-
-        return {
-            "chainId": "solana",
-            "dexId": dex_name,
-            "baseToken": {
-                "address": address,
-                "name": name,
-                "symbol": symbol,
-            },
-            "priceUsd": price,
-            "priceChange": {
-                "h1": change.get("h1", "N/A"),
-                "h24": change.get("h24", "N/A"),
-            },
-            "volume": {
-                "h24": volume.get("h24", volume24 if volume24 is not None else "N/A"),
-            },
-            "liquidity": {"usd": liquidity_usd},
-            "marketCap": market_cap,
-            "fdv": fdv,
-            "url": pool_url,
-            "_gecko": True,
-            "_logoUrl": (token_data or {}).get("imageUrl"),
-        }
-    except (requests.RequestException, ValueError, TypeError, AttributeError):
-        return None
-
-
 def get_token_info(address):
-    """Look up a Solana token by its exact mint address.
-
-    DexScreener remains the primary source. GeckoTerminal is used as a
-    second market-data source when DexScreener has not indexed the token.
-    Solana RPC is used only as the final validity check, so valid but
-    unlisted mints are not confused with market-data failures.
-    """
-    address = normalize_token_address(address)
-    if not address:
-        return None
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "ApeRadarX/1.0",
-    }
-
-    direct_urls = [
-        f"https://api.dexscreener.com/tokens/v1/solana/{address}",
-        f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-    ]
-
-    for url in direct_urls:
-        try:
-            res = requests.get(url, headers=headers, timeout=12)
-            if res.status_code != 200:
-                continue
-            data = res.json()
-            pairs = data if isinstance(data, list) else (
-                data.get("pairs") or [] if isinstance(data, dict) else []
-            )
-
-            solana_pairs = [
-                p for p in pairs
-                if isinstance(p, dict)
-                and (not p.get("chainId") or p.get("chainId") == "solana")
-                and (
-                    (p.get("baseToken") or {}).get("address") == address
-                    or (p.get("quoteToken") or {}).get("address") == address
-                )
-            ]
-            pair = _choose_best_pair(solana_pairs)
-            if pair:
-                return pair
-        except (requests.RequestException, ValueError, TypeError, AttributeError):
-            continue
-
-    # DexScreener search fallback.
     try:
-        res = requests.get(
-            f"https://api.dexscreener.com/latest/dex/search?q={address}",
-            headers=headers,
-            timeout=12,
-        )
-        if res.status_code == 200:
-            data = res.json()
-            pairs = data.get("pairs") or [] if isinstance(data, dict) else []
-            pairs = [
-                p for p in pairs
-                if isinstance(p, dict)
-                and p.get("chainId") == "solana"
-                and (
-                    (p.get("baseToken") or {}).get("address") == address
-                    or (p.get("quoteToken") or {}).get("address") == address
-                )
-            ]
-            pair = _choose_best_pair(pairs)
-            if pair:
-                return pair
-    except (requests.RequestException, ValueError, TypeError, AttributeError):
-        pass
-
-    # Second market-data source. This is the important part for tokens that
-    # are tradable on Solana but are missing from DexScreener's index.
-    gecko_pair = _get_gecko_token_pair(address, headers)
-    if gecko_pair:
-        return gecko_pair
-
-    # Last resort: only verify the mint. Do NOT fabricate market data.
-    # This branch is intentionally marked on-chain-only so the UI can clearly
-    # distinguish "valid mint, no indexed market" from a priced token.
-    supply = _rpc_validate_solana_mint(address)
-    if supply is not None:
-        token_meta = _get_gecko_token_info(address, headers)
-        return {
-            "chainId": "solana",
-            "dexId": "solana",
-            "baseToken": {
-                "address": address,
-                "name": (token_meta or {}).get("name") or "Solana Token",
-                "symbol": (token_meta or {}).get("symbol") or "TOKEN",
-            },
-            "priceUsd": (token_meta or {}).get("priceUsd"),
-            "priceChange": {},
-            "volume": {},
-            "liquidity": {"usd": (token_meta or {}).get("liquidity")},
-            "marketCap": (token_meta or {}).get("marketCap"),
-            "fdv": (token_meta or {}).get("fdv"),
-            "url": f"https://solscan.io/token/{address}",
-            "_onchainOnly": True,
-            "_supply": supply,
-            "_logoUrl": (token_meta or {}).get("imageUrl"),
-        }
-
-    return None
+        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
+        pairs = res.json().get("pairs")
+        if not pairs: return None
+        return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
+    except: return None
 
 def format_number(n):
     try:
@@ -556,7 +253,7 @@ def build_token_message(pair):
     base = pair.get("baseToken", {})
     name = base.get("name","Unknown")
     symbol = base.get("symbol","???")
-    price_usd = pair.get("priceUsd")
+    price_usd = pair.get("priceUsd","N/A")
     h1 = pair.get("priceChange",{}).get("h1","N/A")
     h24 = pair.get("priceChange",{}).get("h24","N/A")
     volume_24h = pair.get("volume",{}).get("h24","N/A")
@@ -567,18 +264,10 @@ def build_token_message(pair):
     def sign(v):
         try: return "🟢 +" if float(v) >= 0 else "🔴 "
         except: return ""
-    if price_usd is not None:
-        try:
-            price_line = f"💵 Price: `${float(price_usd):.8f}`\n"
-        except (TypeError, ValueError):
-            price_line = "💵 Price: `N/A`\n"
-    else:
-        price_line = "💵 Price: `N/A`\n"
-
     msg = (
         f"🪙 *{name}* (${symbol})\n"
         f"━━━━━━━━━━━━━━━━━\n"
-        f"{price_line}"
+        f"💵 Price: `${float(price_usd):.8f}`\n"
         f"📈 1h:  {sign(h1)}{h1}%\n"
         f"📊 24h: {sign(h24)}{h24}%\n"
         f"━━━━━━━━━━━━━━━━━\n"
@@ -587,10 +276,7 @@ def build_token_message(pair):
         f"🏦 Market Cap: {format_number(market_cap)}\n"
         f"🔁 DEX: {dex}\n"
     )
-    if pair.get("_onchainOnly"):
-        msg += "\nℹ️ Token verified on Solana. No indexed DEX pair was found yet."
-    elif url:
-        msg += f"\n[📎 View on DexScreener]({url})"
+    if url: msg += f"\n[📎 View on DexScreener]({url})"
     return msg
 
 def token_keyboard(symbol, address):
@@ -776,17 +462,16 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        address = normalize_token_address(text)
-        if address:
+        if 32 <= len(text) <= 44 and text.isalnum():
             await update.message.reply_text("🔍 Fetching token info...")
-            pair = get_token_info(address)
+            pair = get_token_info(text)
             if pair:
                 base_token = pair.get("baseToken", {})
                 name = base_token.get("name", "Unknown")
                 symbol = base_token.get("symbol", "TOKEN")
                 current_mcap = pair.get("marketCap", 0)
                 waiting_for_pnl[user.id] = {
-                    "step": "buy_mcap", "address": address, "name": name, "symbol": symbol,
+                    "step": "buy_mcap", "address": text, "name": name, "symbol": symbol,
                     "current_mcap": float(current_mcap) if current_mcap else 0,
                     "logo_url": pair.get("info",{}).get("imageUrl"),
                 }
@@ -834,19 +519,18 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
         return
 
-    address = normalize_token_address(text)
-    if address:
+    if 32 <= len(text) <= 44 and text.isalnum():
         await update.message.reply_text("🔍 Scanning token...")
-        pair = get_token_info(address)
+        pair = get_token_info(text)
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
-            await notify_admin(context, user, f"🔍 Scanned: {symbol}", address)
+            await notify_admin(context, user, f"🔍 Scanned: {symbol}", text)
             await update.message.reply_text(
                 build_token_message(pair), parse_mode="Markdown",
-                reply_markup=token_keyboard(symbol, address),
+                reply_markup=token_keyboard(symbol, text),
                 disable_web_page_preview=True)
         else:
-            await notify_admin(context, user, "❌ Token not found", address)
+            await notify_admin(context, user, "❌ Token not found", text)
             await update.message.reply_text("❌ Token not found. Paste a valid Solana contract address.")
     else:
         await notify_admin(context, user, "💬 Message", text)
