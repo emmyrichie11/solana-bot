@@ -223,13 +223,159 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 # Token helpers
 # ─────────────────────────────────────────────
+def _clean_token_address(address):
+    """Clean a pasted Solana mint address without changing its value."""
+    if not isinstance(address, str):
+        return ""
+    address = address.strip().replace("`", "")
+    # If a user pastes a full explorer/DexScreener URL, keep only the path's
+    # last address-looking component. Plain CA pastes are left untouched.
+    address = address.rstrip("/ \t\r\n")
+    if "/" in address:
+        candidate = address.split("/")[-1].split("?")[0].split("#")[0]
+        if candidate:
+            address = candidate
+    return address.strip()
+
+
+def _is_solana_mint(address):
+    # Solana addresses are base58 strings, normally 32-44 characters.
+    # This prevents an unrelated word/search query from being treated as a CA.
+    return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", address or ""))
+
+
+def _pair_matches_address(pair, address):
+    """Only accept a pair whose base or quote token is the pasted mint."""
+    target = address.lower()
+    base = str(pair.get("baseToken", {}).get("address", "")).lower()
+    quote = str(pair.get("quoteToken", {}).get("address", "")).lower()
+    return base == target or quote == target
+
+
+def _pair_has_market_data(pair):
+    """Require an actual trading pair with usable market data."""
+    if not isinstance(pair, dict):
+        return False
+    if str(pair.get("chainId", "")).lower() != "solana":
+        return False
+    if not pair.get("pairAddress"):
+        return False
+    price = pair.get("priceUsd")
+    liquidity = (pair.get("liquidity") or {}).get("usd")
+    volume = (pair.get("volume") or {}).get("h24")
+    market_cap = pair.get("marketCap") or pair.get("fdv")
+    # A real DEX pair should have at least one live market-data field.
+    return any(v not in (None, "", "N/A") for v in (price, liquidity, volume, market_cap))
+
+
+def _gecko_pool_to_pair(pool, token_info=None):
+    """Convert a GeckoTerminal pool into the pair shape used by this bot."""
+    attrs = (pool or {}).get("attributes") or {}
+    relationships = (pool or {}).get("relationships") or {}
+
+    pool_address = attrs.get("address") or (pool or {}).get("id", "").split("_")[-1]
+    name = attrs.get("name", "")
+
+    # Gecko pool names are generally 'TOKEN / QUOTE'. Use token info when
+    # available so the PnL card gets the actual token name/symbol.
+    ti = ((token_info or {}).get("data") or {}).get("attributes") or {}
+    token_name = ti.get("name") or (name.split(" / ")[0] if name else "Unknown")
+    token_symbol = ti.get("symbol") or (name.split(" / ")[0] if name else "TOKEN")
+
+    price = attrs.get("base_token_price_usd") or attrs.get("quote_token_price_usd")
+    volume = attrs.get("volume_usd") or {}
+    changes = attrs.get("price_change_percentage") or {}
+    liquidity = attrs.get("reserve_in_usd")
+    market_cap = attrs.get("market_cap_usd") or ti.get("market_cap_usd")
+    fdv = attrs.get("fdv_usd") or ti.get("fdv_usd")
+
+    return {
+        "chainId": "solana",
+        "dexId": ((relationships.get("dex") or {}).get("data") or {}).get("id", "geckoterminal").split("_")[-1],
+        "url": f"https://www.geckoterminal.com/solana/pools/{pool_address}" if pool_address else "",
+        "pairAddress": pool_address,
+        "baseToken": {"address": ti.get("address", ""), "name": token_name, "symbol": token_symbol},
+        "quoteToken": {},
+        "priceUsd": price,
+        "volume": {"h24": volume.get("h24")},
+        "priceChange": {"h1": changes.get("h1"), "h24": changes.get("h24")},
+        "liquidity": {"usd": liquidity},
+        "marketCap": market_cap,
+        "fdv": fdv,
+        "info": {"imageUrl": ti.get("image_url") or ti.get("imageUrl")},
+    }
+
+
 def get_token_info(address):
+    """Return real Solana DEX market data for the exact pasted mint.
+
+    Lookup order: current DexScreener token-pairs endpoint, current token
+    endpoint, legacy DexScreener endpoint, then GeckoTerminal.  A token is
+    considered 'not found' only when none of those sources has a real Solana
+    trading pool with market data for that exact mint.
+    """
+    address = _clean_token_address(address)
+    if not _is_solana_mint(address):
+        return None
+
+    headers = {"Accept": "application/json", "User-Agent": "ApeRadarX/1.0"}
+
+    def choose_pairs(pairs):
+        valid = []
+        for p in pairs or []:
+            if _pair_matches_address(p, address) and _pair_has_market_data(p):
+                valid.append(p)
+        if not valid:
+            return None
+        return max(valid, key=lambda p: float(((p.get("liquidity") or {}).get("usd")) or 0))
+
+    # 1) Current documented DexScreener endpoint: all pools for this mint.
+    for url in (
+        f"https://api.dexscreener.com/token-pairs/v1/solana/{address}",
+        f"https://api.dexscreener.com/tokens/v1/solana/{address}",
+        f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+    ):
+        try:
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            pairs = data if isinstance(data, list) else data.get("pairs", [])
+            pair = choose_pairs(pairs)
+            if pair:
+                return pair
+        except (requests.RequestException, ValueError, TypeError):
+            continue
+
+    # 2) GeckoTerminal fallback. Only use it if the exact mint has an actual
+    # trading pool and real market data; never manufacture a $0 TOKEN result.
     try:
-        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
-        pairs = res.json().get("pairs")
-        if not pairs: return None
-        return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
-    except: return None
+        token_url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}"
+        token_res = requests.get(token_url, headers=headers, timeout=10)
+        token_data = token_res.json() if token_res.status_code == 200 else {}
+
+        pools_url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools"
+        pools_res = requests.get(pools_url, headers=headers, timeout=10)
+        if pools_res.status_code == 200:
+            pools = (pools_res.json() or {}).get("data", [])
+            converted = []
+            for pool in pools:
+                pair = _gecko_pool_to_pair(pool, token_data)
+                # Gecko's token endpoint is authoritative for the mint.
+                pair["baseToken"]["address"] = address
+                if pair.get("pairAddress") and any(
+                    v not in (None, "", "N/A")
+                    for v in (pair.get("priceUsd"), (pair.get("liquidity") or {}).get("usd"),
+                              (pair.get("volume") or {}).get("h24"), pair.get("marketCap"), pair.get("fdv"))
+                ):
+                    converted.append(pair)
+            if converted:
+                return max(converted, key=lambda p: float(((p.get("liquidity") or {}).get("usd")) or 0))
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+
+    # No real pool/market data was found for this exact Solana mint.
+    return None
 
 def format_number(n):
     try:
@@ -462,16 +608,17 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        if 32 <= len(text) <= 44 and text.isalnum():
+        cleaned_text = _clean_token_address(text)
+        if _is_solana_mint(cleaned_text):
             await update.message.reply_text("🔍 Fetching token info...")
-            pair = get_token_info(text)
+            pair = get_token_info(cleaned_text)
             if pair:
                 base_token = pair.get("baseToken", {})
                 name = base_token.get("name", "Unknown")
                 symbol = base_token.get("symbol", "TOKEN")
                 current_mcap = pair.get("marketCap", 0)
                 waiting_for_pnl[user.id] = {
-                    "step": "buy_mcap", "address": text, "name": name, "symbol": symbol,
+                    "step": "buy_mcap", "address": cleaned_text, "name": name, "symbol": symbol,
                     "current_mcap": float(current_mcap) if current_mcap else 0,
                     "logo_url": pair.get("info",{}).get("imageUrl"),
                 }
@@ -519,18 +666,19 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
         return
 
-    if 32 <= len(text) <= 44 and text.isalnum():
+    cleaned_text = _clean_token_address(text)
+    if _is_solana_mint(cleaned_text):
         await update.message.reply_text("🔍 Scanning token...")
-        pair = get_token_info(text)
+        pair = get_token_info(cleaned_text)
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
             await notify_admin(context, user, f"🔍 Scanned: {symbol}", text)
             await update.message.reply_text(
                 build_token_message(pair), parse_mode="Markdown",
-                reply_markup=token_keyboard(symbol, text),
+                reply_markup=token_keyboard(symbol, cleaned_text),
                 disable_web_page_preview=True)
         else:
-            await notify_admin(context, user, "❌ Token not found", text)
+            await notify_admin(context, user, "❌ Token not found", cleaned_text)
             await update.message.reply_text("❌ Token not found. Paste a valid Solana contract address.")
     else:
         await notify_admin(context, user, "💬 Message", text)
