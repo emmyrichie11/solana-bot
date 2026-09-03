@@ -226,6 +226,8 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 def get_token_info(address):
     try:
         res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
+        if res.status_code != 200:
+            return None
         pairs = res.json().get("pairs")
         if not pairs: return None
         return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
