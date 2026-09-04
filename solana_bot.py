@@ -1,4 +1,4 @@
-# trigger redeploy v8
+# trigger redeploy v10
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -22,7 +22,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BOT_NAME = "ApeRadarX"
 ADMIN_ID = 1495066761
-PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698}
+PNL_ALLOWED = {1495066761, 6203945884, 8730420346}
 
 # Background image URL (hosted on GitHub)
 
@@ -224,160 +224,12 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # Token helpers
 # ─────────────────────────────────────────────
 def get_token_info(address):
-    """Get complete data for the exact Solana mint using GeckoTerminal."""
     try:
-        address = str(address).strip().strip('`').strip()
-        if not re.fullmatch(r'[1-9A-HJ-NP-Za-km-z]{32,44}', address):
-            return None
-
-        base = 'https://api.geckoterminal.com/api/v2'
-        headers = {'Accept':'application/json;version=20230203','User-Agent':'Mozilla/5.0'}
-
-        def fetch(url, attempts=3):
-            last = None
-            for attempt in range(attempts):
-                try:
-                    r = requests.get(url, headers=headers, timeout=15)
-                    if r.status_code == 429:
-                        import time
-                        time.sleep(1.5 * (attempt + 1))
-                        continue
-                    r.raise_for_status()
-                    return r.json()
-                except Exception as e:
-                    last = e
-                    if attempt < attempts - 1:
-                        import time
-                        time.sleep(0.8 * (attempt + 1))
-            if last:
-                raise last
-            return {}
-
-        def num(v, default=0.0):
-            try: return float(v)
-            except (TypeError, ValueError): return default
-
-        def nval(obj, key, default=0):
-            return obj.get(key, default) if isinstance(obj, dict) else default
-
-        # Token metadata is independent from pool discovery. A temporary
-        # metadata failure must not make a live pool look nonexistent.
-        token_attr = {}
-        try:
-            token_json = fetch(f'{base}/networks/solana/tokens/{address}')
-            token_attr = ((token_json.get('data') or {}).get('attributes') or {})
-        except Exception:
-            pass
-
-        # Include the pool's base/quote token resources and DEX resource so
-        # names, symbols and images are available in one response.
-        pools_json = fetch(
-            f'{base}/networks/solana/tokens/{address}/pools'
-            '?include=base_token,quote_token,dex'
-        )
-        pools = pools_json.get('data') or []
-        included = pools_json.get('included') or []
-        if not pools:
-            return None
-
-        included_by_id = {x.get('id'): x for x in included if x.get('id')}
-        best = None
-        best_liq = 0.0
-
-        for pool in pools:
-            pa = pool.get('attributes') or {}
-            liq = num(pa.get('reserve_in_usd'))
-            if liq <= 0:
-                continue
-            rel = pool.get('relationships') or {}
-            b = (rel.get('base_token') or {}).get('data') or {}
-            q = (rel.get('quote_token') or {}).get('data') or {}
-            bid, qid = b.get('id',''), q.get('id','')
-            if bid and qid:
-                ba, qa = bid.split('_',1)[-1], qid.split('_',1)[-1]
-                if address not in (ba, qa):
-                    continue
-            if liq > best_liq:
-                best, best_liq = pool, liq
-
-        if not best:
-            return None
-
-        pa = best.get('attributes') or {}
-        rel = best.get('relationships') or {}
-        b = (rel.get('base_token') or {}).get('data') or {}
-        q = (rel.get('quote_token') or {}).get('data') or {}
-        bid, qid = b.get('id',''), q.get('id','')
-        battr = (included_by_id.get(bid) or {}).get('attributes') or {}
-        qattr = (included_by_id.get(qid) or {}).get('attributes') or {}
-
-        if bid:
-            is_base = address == bid.split('_',1)[-1]
-        elif qid:
-            is_base = False
-        else:
-            is_base = True
-        side = battr if is_base else qattr
-
-        name = token_attr.get('name') or side.get('name') or token_attr.get('symbol') or side.get('symbol')
-        symbol = token_attr.get('symbol') or side.get('symbol')
-        if not name or not symbol:
-            # One final exact-token metadata retry before declaring it unknown.
-            try:
-                token_json = fetch(f'{base}/networks/solana/tokens/{address}')
-                ta2 = ((token_json.get('data') or {}).get('attributes') or {})
-                name = name or ta2.get('name')
-                symbol = symbol or ta2.get('symbol')
-                token_attr = {**ta2, **token_attr}
-            except Exception:
-                pass
-        name = name or 'Unknown Token'
-        symbol = symbol or 'TOKEN'
-
-        price_key = 'base_token_price_usd' if is_base else 'quote_token_price_usd'
-        price = num(pa.get(price_key)) or num(token_attr.get('price_usd')) or num(side.get('price_usd'))
-        if price <= 0 or best_liq <= 0:
-            return None
-
-        mcap = num(token_attr.get('market_cap_usd')) or num(pa.get('market_cap_usd'))
-        fdv = num(token_attr.get('fdv_usd')) or num(pa.get('fdv_usd'))
-        volume = nval(pa.get('volume_usd') or {}, 'h24', 0) or num(token_attr.get('volume_usd'))
-        changes = pa.get('price_change_percentage') or {}
-        h1, h6, h24 = nval(changes,'h1',0), nval(changes,'h6',0), nval(changes,'h24',0)
-
-        dex_rel = (rel.get('dex') or {}).get('data') or {}
-        dex_attr = (included_by_id.get(dex_rel.get('id','')) or {}).get('attributes') or {}
-        dex = dex_attr.get('name') or 'N/A'
-
-        pool_id = best.get('id','')
-        pool_address = pool_id.split('_',1)[-1] if pool_id else ''
-        pool_url = f'https://www.geckoterminal.com/solana/pools/{pool_address}' if pool_address else ''
-
-        # Try every image field exposed by GeckoTerminal. This is kept in the
-        # same info.imageUrl field consumed by the ORIGINAL PnL generator.
-        image_url = (
-            token_attr.get('image_url') or token_attr.get('imageUrl') or token_attr.get('image')
-            or side.get('image_url') or side.get('imageUrl') or side.get('image')
-        )
-        info = token_attr.get('info') or side.get('info') or {}
-        if isinstance(info, dict):
-            image_url = image_url or info.get('image_url') or info.get('imageUrl')
-
-        return {
-            'baseToken': {'name': str(name), 'symbol': str(symbol), 'address': address},
-            'priceUsd': str(price),
-            'priceChange': {'h1': h1, 'h6': h6, 'h24': h24},
-            'volume': {'h24': volume},
-            'liquidity': {'usd': best_liq},
-            'marketCap': mcap,
-            'fdv': fdv,
-            'dexId': str(dex),
-            'url': pool_url,
-            'info': {'imageUrl': image_url},
-        }
-    except Exception:
-        return None
-
+        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
+        pairs = res.json().get("pairs")
+        if not pairs: return None
+        return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
+    except: return None
 
 def format_number(n):
     try:
