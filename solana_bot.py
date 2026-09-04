@@ -1,4 +1,4 @@
-# trigger redeploy v11
+# trigger redeploy v7
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -224,12 +224,100 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # Token helpers
 # ─────────────────────────────────────────────
 def get_token_info(address):
+    import time, random
+
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    ]
+    ua = random.choice(user_agents)
+
+    # ── 1. Try DexScreener ──
+    for url in [
+        f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+        f"https://api.dexscreener.com/latest/dex/search?q={address}",
+    ]:
+        try:
+            r = requests.get(url, headers={"User-Agent": ua, "Accept": "application/json"}, timeout=12)
+            if r.status_code == 200:
+                pairs = r.json().get("pairs")
+                if pairs:
+                    return sorted(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)[0]
+        except: pass
+
+    # ── 2. Try GeckoTerminal ──
     try:
-        res = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{address}", timeout=10)
-        pairs = res.json().get("pairs")
-        if not pairs: return None
-        return sorted(pairs, key=lambda p: float(p.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
-    except: return None
+        r = requests.get(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1",
+            headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
+            timeout=12
+        )
+        if r.status_code == 200:
+            pools = r.json().get("data", [])
+            if pools:
+                pool = pools[0]
+                attrs = pool.get("attributes", {})
+                # Get token details
+                sym, name = address[:6].upper(), address[:8]
+                try:
+                    tr = requests.get(
+                        f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}",
+                        headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
+                        timeout=8
+                    )
+                    if tr.status_code == 200:
+                        ta = tr.json().get("data", {}).get("attributes", {})
+                        sym = ta.get("symbol", sym)
+                        name = ta.get("name", name)
+                except: pass
+
+                return {
+                    "baseToken": {"symbol": sym, "name": name},
+                    "priceUsd": str(attrs.get("base_token_price_usd") or "0"),
+                    "priceChange": {
+                        "h1": str(attrs.get("price_change_percentage", {}).get("h1") or "0"),
+                        "h24": str(attrs.get("price_change_percentage", {}).get("h24") or "0"),
+                    },
+                    "volume": {"h24": str(attrs.get("volume_usd", {}).get("h24") or "0")},
+                    "liquidity": {"usd": str(attrs.get("reserve_in_usd") or "0")},
+                    "marketCap": str(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0"),
+                    "dexId": pool.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "DEX"),
+                    "url": f"https://www.geckoterminal.com/solana/pools/{pool.get('id', '')}",
+                    "info": {}
+                }
+    except: pass
+
+    # ── 3. Try Pump.fun API ──
+    try:
+        r = requests.get(
+            f"https://frontend-api.pump.fun/coins/{address}",
+            headers={"User-Agent": ua, "Accept": "application/json"},
+            timeout=12
+        )
+        if r.status_code == 200:
+            d = r.json()
+            if d:
+                sym = d.get("symbol", address[:6].upper())
+                name = d.get("name", sym)
+                price = d.get("usd_market_cap", 0)
+                mcap = d.get("usd_market_cap", 0)
+                return {
+                    "baseToken": {"symbol": sym, "name": name},
+                    "priceUsd": str(d.get("virtual_sol_reserves", 0)),
+                    "priceChange": {"h1": "0", "h24": "0"},
+                    "volume": {"h24": "0"},
+                    "liquidity": {"usd": str(d.get("virtual_sol_reserves", 0))},
+                    "marketCap": str(mcap),
+                    "dexId": "PUMPFUN",
+                    "url": f"https://pump.fun/{address}",
+                    "info": {"imageUrl": d.get("image_uri")}
+                }
+    except: pass
+
+    return None
+
+
 
 def format_number(n):
     try:
