@@ -1,4 +1,4 @@
-# trigger redeploy v10
+# trigger redeploy v11
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
