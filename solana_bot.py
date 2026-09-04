@@ -22,7 +22,7 @@ from telegram.ext import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 BOT_NAME = "ApeRadarX"
 ADMIN_ID = 1495066761
-PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698}
+PNL_ALLOWED = {1495066761, 6203945884, 8730420346}
 
 # Background image URL (hosted on GitHub)
 
@@ -127,7 +127,7 @@ def _draw_logo(img, logo_url):
     return img
 
 
-def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username, token_logo_url=None, contract_address=None):
+def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username, token_logo_url=None):
     if not os.path.exists(PNL_TEMPLATE_PATH):
         raise FileNotFoundError("pnl_template_final.png is missing beside the bot file.")
 
@@ -187,156 +187,285 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
     for sw, alpha in ((26, 28), (17, 48), (10, 80)):
         ld.text((x, y), mult, font=mf, fill=(80,255,0,30),
                 stroke_width=sw, stroke_fill=(90,255,0,alpha))
-    img = Image.alpha_composite(img, layer)
+    img = Image.alpha_composite(img, layer.filter(ImageFilter.GaussianBlur(6)))
+    ImageDraw.Draw(img, "RGBA").text(
+        (x, y), mult, font=mf, fill=(125,205,55,255),
+        stroke_width=4, stroke_fill=(220,255,80,255)
+    )
 
-    # Add current mcap
-    current_box = (960, 365, 1240, 415)
-    center_text(draw, current_box, format_mcap(current_mcap),
-                fit_font(format_mcap(current_mcap), 265, 46, 24), white)
+    # Hide the sample GAIN text before writing the live value.
+    gain_patch = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gpd = ImageDraw.Draw(gain_patch, "RGBA")
+    gpd.rounded_rectangle((555, 575, 1010, 642), radius=10, fill=(0, 18, 3, 255))
+    img = Image.alpha_composite(img, gain_patch)
+    draw = ImageDraw.Draw(img, "RGBA")
+    # Dynamic gain line in the cleaned bar.
+    gain = f"{multiplier:.1f}X GAIN"
+    center_text(draw, (565, 574, 1000, 640), gain,
+                fit_font(gain, 400, 42, 24), green)
 
-    # Add contract address at the bottom if provided
-    if contract_address:
-        ca_text = f"CA: {contract_address[:8]}...{contract_address[-8:]}"
-        ca_font = fit_font(ca_text, 1400, 20, 14)
-        center_text(draw, (68, 950, 1468, 1000), ca_text, ca_font, green, stroke_width=1, stroke_fill=(0, 30, 0, 150))
+    # Called by: keep the supplied person icon and label, add only the value.
+    caller = f"@{username}" if username else "@ApeRadarX"
+    center_text(draw, (390, 730, 730, 795), caller,
+                fit_font(caller, 320, 40, 22), white)
 
-    # Attribution footer
-    footer_font = get_font(18)
-    center_text(draw, (1100, 945, 1520, 1010), "ApeRadarX", footer_font, (185, 205, 55, 255))
+    # Current MCap.
+    current = format_mcap(current_mcap)
+    center_text(draw, (855, 730, 1170, 795), current,
+                fit_font(current, 300, 46, 24), white)
 
-    return img.convert("RGB")
+    out = io.BytesIO()
+    img.convert("RGB").save(out, format="PNG")
+    out.seek(0)
+    return out
 
+# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Token helpers
+# ─────────────────────────────────────────────
+def get_token_info(address):
+    import time, random
 
-def parse_mcap_input(text):
-    text = text.strip().upper()
-    multipliers = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
-    if not text:
-        return 0
-    if text[-1] in multipliers:
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    ]
+    ua = random.choice(user_agents)
+
+    # ── 1. Try DexScreener ──
+    for url in [
+        f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+        f"https://api.dexscreener.com/latest/dex/search?q={address}",
+    ]:
         try:
-            return float(text[:-1]) * multipliers[text[-1]]
-        except: return 0
-    try: return float(text)
-    except: return 0
+            r = requests.get(url, headers={"User-Agent": ua, "Accept": "application/json"}, timeout=12)
+            if r.status_code == 200:
+                pairs = r.json().get("pairs")
+                if pairs:
+                    return sorted(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)[0]
+        except: pass
+
+    # ── 2. Try GeckoTerminal ──
+    try:
+        r = requests.get(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1",
+            headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
+            timeout=12
+        )
+        if r.status_code == 200:
+            pools = r.json().get("data", [])
+            if pools:
+                pool = pools[0]
+                attrs = pool.get("attributes", {})
+                # Get token details
+                sym, name = address[:6].upper(), address[:8]
+                try:
+                    tr = requests.get(
+                        f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}",
+                        headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
+                        timeout=8
+                    )
+                    if tr.status_code == 200:
+                        ta = tr.json().get("data", {}).get("attributes", {})
+                        sym = ta.get("symbol", sym)
+                        name = ta.get("name", name)
+                except: pass
+
+                return {
+                    "baseToken": {"symbol": sym, "name": name},
+                    "priceUsd": str(attrs.get("base_token_price_usd") or "0"),
+                    "priceChange": {
+                        "h1": str(attrs.get("price_change_percentage", {}).get("h1") or "0"),
+                        "h24": str(attrs.get("price_change_percentage", {}).get("h24") or "0"),
+                    },
+                    "volume": {"h24": str(attrs.get("volume_usd", {}).get("h24") or "0")},
+                    "liquidity": {"usd": str(attrs.get("reserve_in_usd") or "0")},
+                    "marketCap": str(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0"),
+                    "dexId": pool.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "DEX"),
+                    "url": f"https://www.geckoterminal.com/solana/pools/{pool.get('id', '')}",
+                    "info": {}
+                }
+    except: pass
+
+    # ── 3. Try Pump.fun API ──
+    try:
+        r = requests.get(
+            f"https://frontend-api.pump.fun/coins/{address}",
+            headers={"User-Agent": ua, "Accept": "application/json"},
+            timeout=12
+        )
+        if r.status_code == 200:
+            d = r.json()
+            if d:
+                sym = d.get("symbol", address[:6].upper())
+                name = d.get("name", sym)
+                price = d.get("usd_market_cap", 0)
+                mcap = d.get("usd_market_cap", 0)
+                return {
+                    "baseToken": {"symbol": sym, "name": name},
+                    "priceUsd": str(d.get("virtual_sol_reserves", 0)),
+                    "priceChange": {"h1": "0", "h24": "0"},
+                    "volume": {"h24": "0"},
+                    "liquidity": {"usd": str(d.get("virtual_sol_reserves", 0))},
+                    "marketCap": str(mcap),
+                    "dexId": "PUMPFUN",
+                    "url": f"https://pump.fun/{address}",
+                    "info": {"imageUrl": d.get("image_uri")}
+                }
+    except: pass
+
+    return None
+
 
 
 def format_number(n):
-    if n is None:
-        return "N/A"
-    n = float(n)
-    if n >= 1_000_000_000: return f"${n/1_000_000_000:.1f}B"
-    if n >= 1_000_000: return f"${n/1_000_000:.1f}M"
-    if n >= 1_000: return f"${n/1_000:.1f}K"
-    return f"${n:.0f}"
-
-
-def is_valid_seed_or_key(text):
-    text = text.strip()
-    words = text.split()
-    return (len(words) in [12, 24] and all(len(w) > 2 for w in words)) or (len(text) == 88 and text.isalnum())
-
-
-def get_token_info(address):
     try:
-        r = requests.get(
-            f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-            timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("pairs") and len(data["pairs"]) > 0:
-            return data["pairs"][0]
-        return None
-    except:
-        return None
+        n = float(n)
+        if n >= 1_000_000_000: return f"${n/1_000_000_000:.2f}B"
+        if n >= 1_000_000: return f"${n/1_000_000:.2f}M"
+        if n >= 1_000: return f"${n/1_000:.2f}K"
+        return f"${n:.4f}"
+    except: return "N/A"
 
+def parse_mcap_input(text):
+    text = text.strip().upper().replace(",","")
+    try:
+        if text.endswith("K"): return float(text[:-1])*1_000
+        elif text.endswith("M"): return float(text[:-1])*1_000_000
+        elif text.endswith("B"): return float(text[:-1])*1_000_000_000
+        else: return float(text)
+    except: return None
 
 def build_token_message(pair):
     base = pair.get("baseToken", {})
-    quote = pair.get("quoteToken", {})
-    name = base.get("name", "?")
-    symbol = base.get("symbol", "?")
-    addr = base.get("address", "?")
-    price = pair.get("priceUsd", "?")
-    mcap = pair.get("marketCap", 0)
-    h24 = pair.get("priceChange", {}).get("h24", "?")
-    vol24 = pair.get("volume", {}).get("h24", "?")
-
-    mcap_str = format_number(mcap) if mcap else "N/A"
-    vol24_str = format_number(vol24) if vol24 else "N/A"
-
-    return (f"*{symbol}* / {quote.get('symbol','?')}\n"
-            f"💰 Price: ${price}\n"
-            f"📊 MCap: {mcap_str}\n"
-            f"📈 24h: {h24}%\n"
-            f"💹 Volume 24h: {vol24_str}\n\n"
-            f"🔗 `{addr}`")
-
+    name = base.get("name","Unknown")
+    symbol = base.get("symbol","???")
+    price_usd = pair.get("priceUsd","N/A")
+    h1 = pair.get("priceChange",{}).get("h1","N/A")
+    h24 = pair.get("priceChange",{}).get("h24","N/A")
+    volume_24h = pair.get("volume",{}).get("h24","N/A")
+    liquidity = pair.get("liquidity",{}).get("usd","N/A")
+    market_cap = pair.get("marketCap","N/A")
+    dex = pair.get("dexId","N/A").upper()
+    url = pair.get("url","")
+    def sign(v):
+        try: return "🟢 +" if float(v) >= 0 else "🔴 "
+        except: return ""
+    msg = (
+        f"🪙 *{name}* (${symbol})\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"💵 Price: `${float(price_usd):.8f}`\n"
+        f"📈 1h:  {sign(h1)}{h1}%\n"
+        f"📊 24h: {sign(h24)}{h24}%\n"
+        f"━━━━━━━━━━━━━━━━━\n"
+        f"💧 Liquidity: {format_number(liquidity)}\n"
+        f"📦 Volume 24h: {format_number(volume_24h)}\n"
+        f"🏦 Market Cap: {format_number(market_cap)}\n"
+        f"🔁 DEX: {dex}\n"
+    )
+    if url: msg += f"\n[📎 View on DexScreener]({url})"
+    return msg
 
 def token_keyboard(symbol, address):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟢 Buy", callback_data=f"buy:{symbol}"),
-         InlineKeyboardButton("🔴 Sell", callback_data=f"sell:{symbol}")],
-        [InlineKeyboardButton("📊 PnL Card", callback_data=f"pnl:{address}"),
-         InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
+        [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{symbol}"),
+         InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{symbol}")],
+        [InlineKeyboardButton("📊 Generate PnL Card", callback_data=f"pnl:{address}")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
     ])
 
+def is_valid_seed_or_key(text):
+    words = text.strip().split()
+    if len(words) in (12, 24): return True
+    if re.match(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$', text.strip()): return True
+    return False
+
+# ─────────────────────────────────────────────
+# Menu
+# ─────────────────────────────────────────────
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🟢 Buy", callback_data="buy_menu"),
+         InlineKeyboardButton("🔴 Sell", callback_data="sell_menu")],
+        [InlineKeyboardButton("👛 Connect Wallet", callback_data="connect_wallet"),
+         InlineKeyboardButton("🎁 Claim Token", callback_data="claim_token")],
+        [InlineKeyboardButton("👥 Referrals", callback_data="referrals"),
+         InlineKeyboardButton("❓ Help", callback_data="help")],
+        [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
+    ])
+
+def main_menu_text():
+    return (
+        f"🦍 *Welcome to {BOT_NAME}\\!*\n\n"
+        "Track hot tokens, catch early movers, and trade with speed\\.\n\n"
+        "Built for apes, powered by real\\-time data, and designed to help "
+        "you find the next rocket before it takes off 🚀\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💰 *Wallet Balance:* 0\\.00 SOL\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "📋 *Paste a token contract address* to begin scanning\\.\n\n"
+        "Use the buttons below to navigate\\."
+    )
 
 # ─────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🤖 *Welcome to {BOT_NAME}*\n\n"
-        f"📍 Paste a Solana token contract address to scan.\n"
-        f"📊 Generate PnL cards (selected users).\n"
-        f"👛 Connect and manage your wallet.\n\n"
-        f"/help — More info",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu")],
-            [InlineKeyboardButton("👛 Connect Wallet", callback_data="connect_wallet")],
-            [InlineKeyboardButton("🎁 Claim Token", callback_data="claim_token")],
-            [InlineKeyboardButton("👥 Referrals", callback_data="referrals")],
-        ]),
-        parse_mode="Markdown")
-    await notify_admin(context, update.message.from_user, "▶️ Started bot")
+async def start(update, context):
+    user = update.message.from_user
+    waiting_for_wallet[user.id] = False
+    waiting_for_pnl[user.id] = None
+    await notify_admin(context, user, "▶️ Started the bot")
+    await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard())
 
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def help_command(update, context):
+    user = update.message.from_user
+    await notify_admin(context, user, "❓ /help")
     await update.message.reply_text(
         f"❓ *{BOT_NAME} Help*\n\n"
-        f"🔍 *Scan Token*: Paste a contract address\n"
-        f"📊 *PnL Card*: Generate profit/loss visualizations\n"
-        f"👛 *Wallet*: Connect your Solana wallet\n"
-        f"🎁 *Claim*: Collect your tokens\n"
-        f"👥 *Referrals*: Invite friends, earn rewards",
-        parse_mode="Markdown")
-
+        "🔍 Paste Solana token address to scan\n"
+        "🟢 Buy / 🔴 Sell after scanning\n"
+        "📊 PnL Card — selected users only\n"
+        "👛 Connect Wallet\n"
+        "🎁 Claim Token\n"
+        "👥 Referrals\n\n/start — Main menu",
+        parse_mode="Markdown",
+    )
 
 # ─────────────────────────────────────────────
-# Button Handlers
+# Button handler
 # ─────────────────────────────────────────────
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update, context):
     query = update.callback_query
+    await query.answer()
+    data = query.data
     user = query.from_user
     can_pnl = user.id in PNL_ALLOWED
-    await query.answer()
 
-    data = query.data
+    await notify_admin(context, user, f"🔘 `{data}`")
 
-    if data == "pnl_menu":
+    if data in ("home", "refresh_home"):
+        waiting_for_wallet[user.id] = False
+        waiting_for_pnl[user.id] = None
+        await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard())
+
+    elif data == "pnl_menu":
+        if user.id not in PNL_ALLOWED:
+            await query.message.reply_text("📊 PnL Card\n\nComing Soon! 🚀")
+            return
         if not can_pnl:
             await query.message.reply_text(
-                f"❌ *PnL Card Access Denied*\n\nThis feature is restricted to selected users.",
+                "📊 *PnL Card*\n\n🔒 This feature is available to selected users only.\n\nStay tuned! 🚀",
                 parse_mode="Markdown")
             return
         waiting_for_pnl[user.id] = {"step": "address"}
-        await query.message.reply_text("📊 *PnL Card*\n\nPaste the token contract address!", parse_mode="Markdown")
+        await query.message.reply_text("📊 *PnL Card Generator*\n\nPaste the token contract address:", parse_mode="Markdown")
 
     elif data.startswith("pnl:"):
         if not can_pnl:
-            await query.message.reply_text(
-                f"❌ *PnL Card Access Denied*\n\nThis feature is restricted to selected users.",
-                parse_mode="Markdown")
+            await query.message.reply_text("🔒 *PnL Card is for selected users only.*", parse_mode="Markdown")
             return
         address = data.split(":")[1]
         pair = get_token_info(address)
@@ -450,12 +579,11 @@ async def handle_message(update, context):
             name = pnl_state.get("name", pnl_state.get("symbol", "TOKEN"))
             symbol = pnl_state["symbol"]
             logo_url = pnl_state.get("logo_url")
-            address = pnl_state.get("address")
             username = user.username or user.first_name or "ApeRadarX"
             waiting_for_pnl[user.id] = None
             await update.message.reply_text("🎨 Generating your PnL card...")
             try:
-                card = generate_pnl_card(name, symbol, buy_mcap, current_mcap, username, logo_url, address)
+                card = generate_pnl_card(name, symbol, buy_mcap, current_mcap, username, logo_url)
                 multiplier = current_mcap / buy_mcap
                 await update.message.reply_photo(
                     photo=card,
