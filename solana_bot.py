@@ -550,7 +550,7 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        if 32 <= len(text) <= 44 and text.isalnum():
+        if 32 <= len(text) <= 44 and re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', text):
             await update.message.reply_text("🔍 Fetching token info...")
             pair = get_token_info(text)
             if pair:
@@ -607,7 +607,7 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
         return
 
-    if 32 <= len(text) <= 44 and text.isalnum():
+    if 32 <= len(text) <= 44 and re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', text):
         await update.message.reply_text("🔍 Scanning token...")
         pair = get_token_info(text)
         if pair:
