@@ -223,15 +223,63 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 # Token helpers
 # ─────────────────────────────────────────────
-def get_token_info(address):
-    import time, random
 
-    user_agents = [
+def get_token_metadata(address):
+    """Fetch token symbol, name and logo from Jupiter (most reliable)"""
+    import random
+    ua = random.choice([
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
+    ])
+    headers = {"User-Agent": ua, "Accept": "application/json"}
+
+    # 1. Jupiter token API (most reliable, no blocking)
+    try:
+        r = requests.get(f"https://tokens.jup.ag/token/{address}", headers=headers, timeout=8)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("symbol"):
+                return d.get("symbol",""), d.get("name",""), d.get("logoURI","")
+    except: pass
+
+    # 2. GeckoTerminal token endpoint
+    try:
+        r = requests.get(
+            f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}",
+            headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
+            timeout=8
+        )
+        if r.status_code == 200:
+            ta = r.json().get("data", {}).get("attributes", {})
+            if ta.get("symbol"):
+                return ta.get("symbol",""), ta.get("name",""), ta.get("image_url","")
+    except: pass
+
+    # 3. Pump.fun
+    try:
+        r = requests.get(f"https://frontend-api.pump.fun/coins/{address}", headers=headers, timeout=8)
+        if r.status_code == 200:
+            d = r.json()
+            if d.get("symbol"):
+                return d.get("symbol",""), d.get("name",""), d.get("image_uri","")
+    except: pass
+
+    return "", "", ""
+
+
+def get_token_info(address):
+    """Fetch token price info - tries multiple APIs"""
+    import random, time
+
+    ua = random.choice([
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
         "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    ]
-    ua = random.choice(user_agents)
+    ])
+    headers = {"User-Agent": ua, "Accept": "application/json"}
+
+    # Always fetch metadata first (Jupiter is reliable)
+    sym, name, logo = get_token_metadata(address)
 
     # ── 1. Try DexScreener ──
     for url in [
@@ -239,14 +287,21 @@ def get_token_info(address):
         f"https://api.dexscreener.com/latest/dex/search?q={address}",
     ]:
         try:
-            r = requests.get(url, headers={"User-Agent": ua, "Accept": "application/json"}, timeout=12)
+            r = requests.get(url, headers=headers, timeout=12)
             if r.status_code == 200:
                 pairs = r.json().get("pairs")
                 if pairs:
-                    return sorted(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0), reverse=True)[0]
+                    p = sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
+                    # Override with reliable metadata if available
+                    if sym:
+                        p["baseToken"]["symbol"] = sym
+                        p["baseToken"]["name"] = name
+                    if logo and not (p.get("info") or {}).get("imageUrl"):
+                        p.setdefault("info", {})["imageUrl"] = logo
+                    return p
         except: pass
 
-    # ── 2. Try GeckoTerminal ──
+    # ── 2. Try GeckoTerminal pools ──
     try:
         r = requests.get(
             f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1",
@@ -258,22 +313,12 @@ def get_token_info(address):
             if pools:
                 pool = pools[0]
                 attrs = pool.get("attributes", {})
-                # Get token details
-                sym, name = address[:6].upper(), address[:8]
-                try:
-                    tr = requests.get(
-                        f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}",
-                        headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
-                        timeout=8
-                    )
-                    if tr.status_code == 200:
-                        ta = tr.json().get("data", {}).get("attributes", {})
-                        sym = ta.get("symbol", sym)
-                        name = ta.get("name", name)
-                except: pass
-
+                # Use metadata for reliable symbol/name
+                final_sym = sym or attrs.get("base_token_symbol") or address[:6].upper()
+                final_name = name or attrs.get("name") or final_sym
+                final_logo = logo or ""
                 return {
-                    "baseToken": {"symbol": sym, "name": name},
+                    "baseToken": {"symbol": final_sym, "name": final_name},
                     "priceUsd": str(attrs.get("base_token_price_usd") or "0"),
                     "priceChange": {
                         "h1": str(attrs.get("price_change_percentage", {}).get("h1") or "0"),
@@ -283,40 +328,48 @@ def get_token_info(address):
                     "liquidity": {"usd": str(attrs.get("reserve_in_usd") or "0")},
                     "marketCap": str(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0"),
                     "dexId": pool.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "DEX"),
-                    "url": f"https://www.geckoterminal.com/solana/pools/{pool.get('id', '')}",
-                    "info": {}
+                    "url": f"https://www.geckoterminal.com/solana/pools/{pool.get('id','')}",
+                    "info": {"imageUrl": final_logo}
                 }
     except: pass
 
-    # ── 3. Try Pump.fun API ──
+    # ── 3. Try Pump.fun ──
     try:
-        r = requests.get(
-            f"https://frontend-api.pump.fun/coins/{address}",
-            headers={"User-Agent": ua, "Accept": "application/json"},
-            timeout=12
-        )
+        r = requests.get(f"https://frontend-api.pump.fun/coins/{address}", headers=headers, timeout=12)
         if r.status_code == 200:
             d = r.json()
             if d:
-                sym = d.get("symbol", address[:6].upper())
-                name = d.get("name", sym)
-                price = d.get("usd_market_cap", 0)
-                mcap = d.get("usd_market_cap", 0)
+                final_sym = sym or d.get("symbol", address[:6].upper())
+                final_name = name or d.get("name", final_sym)
+                final_logo = logo or d.get("image_uri", "")
                 return {
-                    "baseToken": {"symbol": sym, "name": name},
-                    "priceUsd": str(d.get("virtual_sol_reserves", 0)),
+                    "baseToken": {"symbol": final_sym, "name": final_name},
+                    "priceUsd": "0",
                     "priceChange": {"h1": "0", "h24": "0"},
                     "volume": {"h24": "0"},
-                    "liquidity": {"usd": str(d.get("virtual_sol_reserves", 0))},
-                    "marketCap": str(mcap),
+                    "liquidity": {"usd": "0"},
+                    "marketCap": str(d.get("usd_market_cap", 0)),
                     "dexId": "PUMPFUN",
                     "url": f"https://pump.fun/{address}",
-                    "info": {"imageUrl": d.get("image_uri")}
+                    "info": {"imageUrl": final_logo}
                 }
     except: pass
 
-    return None
+    # ── 4. If we at least have metadata, return basic info ──
+    if sym:
+        return {
+            "baseToken": {"symbol": sym, "name": name},
+            "priceUsd": "0",
+            "priceChange": {"h1": "0", "h24": "0"},
+            "volume": {"h24": "0"},
+            "liquidity": {"usd": "0"},
+            "marketCap": "0",
+            "dexId": "UNKNOWN",
+            "url": f"https://solscan.io/token/{address}",
+            "info": {"imageUrl": logo}
+        }
 
+    return None
 
 
 def format_number(n):
@@ -550,7 +603,7 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        if 32 <= len(text) <= 44 and re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', text):
+        if 32 <= len(text) <= 44 and text.isalnum():
             await update.message.reply_text("🔍 Fetching token info...")
             pair = get_token_info(text)
             if pair:
@@ -607,7 +660,7 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
         return
 
-    if 32 <= len(text) <= 44 and re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', text):
+    if 32 <= len(text) <= 44 and text.isalnum():
         await update.message.reply_text("🔍 Scanning token...")
         pair = get_token_info(text)
         if pair:
