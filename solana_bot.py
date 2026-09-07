@@ -225,16 +225,14 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 
 
+
 def get_token_metadata(address):
-    """Fetch token symbol, name and logo from Jupiter (most reliable)"""
     import random
     ua = random.choice([
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
     ])
     headers = {"User-Agent": ua, "Accept": "application/json"}
-
-    # 1. Jupiter token API
     try:
         r = requests.get(f"https://tokens.jup.ag/token/{address}", headers=headers, timeout=8)
         if r.status_code == 200:
@@ -242,21 +240,15 @@ def get_token_metadata(address):
             if d.get("symbol"):
                 return d.get("symbol",""), d.get("name",""), d.get("logoURI","")
     except: pass
-
-    # 2. GeckoTerminal token endpoint
     try:
         r = requests.get(
             f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}",
-            headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
-            timeout=8
-        )
+            headers={"Accept": "application/json;version=20230302", "User-Agent": ua}, timeout=8)
         if r.status_code == 200:
             ta = r.json().get("data", {}).get("attributes", {})
             if ta.get("symbol"):
                 return ta.get("symbol",""), ta.get("name",""), ta.get("image_url","")
     except: pass
-
-    # 3. Pump.fun
     try:
         r = requests.get(f"https://frontend-api.pump.fun/coins/{address}", headers=headers, timeout=8)
         if r.status_code == 200:
@@ -264,14 +256,11 @@ def get_token_metadata(address):
             if d.get("symbol"):
                 return d.get("symbol",""), d.get("name",""), d.get("image_uri","")
     except: pass
-
     return "", "", ""
 
 
 def get_token_info(address):
-    """Fetch token price info - tries multiple APIs"""
     import random
-
     ua = random.choice([
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
@@ -279,10 +268,9 @@ def get_token_info(address):
     ])
     headers = {"User-Agent": ua, "Accept": "application/json"}
 
-    # Always fetch metadata first (Jupiter is reliable for name/symbol/logo)
     sym, name, logo = get_token_metadata(address)
 
-    # ── 1. Try DexScreener ──
+    # ── 1. DexScreener ──
     for url in [
         f"https://api.dexscreener.com/latest/dex/tokens/{address}",
         f"https://api.dexscreener.com/latest/dex/search?q={address}",
@@ -293,21 +281,16 @@ def get_token_info(address):
                 pairs = r.json().get("pairs")
                 if pairs:
                     p = sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
-                    if sym:
-                        p["baseToken"]["symbol"] = sym
-                        p["baseToken"]["name"] = name
-                    if logo and not (p.get("info") or {}).get("imageUrl"):
-                        p.setdefault("info", {})["imageUrl"] = logo
+                    if sym: p["baseToken"]["symbol"] = sym; p["baseToken"]["name"] = name
+                    if logo: p.setdefault("info", {})["imageUrl"] = logo
                     return p
         except: pass
 
-    # ── 2. Try GeckoTerminal pools ──
+    # ── 2. GeckoTerminal pools ──
     try:
         r = requests.get(
             f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1",
-            headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
-            timeout=12
-        )
+            headers={"Accept": "application/json;version=20230302", "User-Agent": ua}, timeout=12)
         if r.status_code == 200:
             pools = r.json().get("data", [])
             if pools:
@@ -315,83 +298,59 @@ def get_token_info(address):
                 attrs = pool.get("attributes", {})
                 final_sym = sym or attrs.get("base_token_symbol") or address[:6].upper()
                 final_name = name or final_sym
-                final_logo = logo or ""
-                price = attrs.get("base_token_price_usd") or "0"
-                mcap = attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0"
-                vol = attrs.get("volume_usd", {}).get("h24") or "0"
-                liq = attrs.get("reserve_in_usd") or "0"
-                h24 = attrs.get("price_change_percentage", {}).get("h24") or "0"
-                h1 = attrs.get("price_change_percentage", {}).get("h1") or "0"
-                return {
-                    "baseToken": {"symbol": final_sym, "name": final_name},
-                    "priceUsd": str(price),
-                    "priceChange": {"h1": str(h1), "h24": str(h24)},
-                    "volume": {"h24": str(vol)},
-                    "liquidity": {"usd": str(liq)},
-                    "marketCap": str(mcap),
-                    "dexId": pool.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "DEX"),
-                    "url": f"https://www.geckoterminal.com/solana/pools/{pool.get('id','')}",
-                    "info": {"imageUrl": final_logo}
-                }
+                price = str(attrs.get("base_token_price_usd") or "0")
+                mcap = str(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0")
+                vol = str(attrs.get("volume_usd", {}).get("h24") or "0")
+                liq = str(attrs.get("reserve_in_usd") or "0")
+                h24 = str(attrs.get("price_change_percentage", {}).get("h24") or "0")
+                h1 = str(attrs.get("price_change_percentage", {}).get("h1") or "0")
+                dex_id = pool.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "DEX")
+                pool_id = pool.get("id","")
+                # Only return if we have real price data
+                if float(price) > 0 or float(liq) > 0:
+                    return {
+                        "baseToken": {"symbol": final_sym, "name": final_name},
+                        "priceUsd": price, "priceChange": {"h1": h1, "h24": h24},
+                        "volume": {"h24": vol}, "liquidity": {"usd": liq},
+                        "marketCap": mcap, "dexId": dex_id,
+                        "url": f"https://www.geckoterminal.com/solana/pools/{pool_id}",
+                        "info": {"imageUrl": logo}
+                    }
     except: pass
 
-    # ── 3. Try CoinGecko ──
-    try:
-        r = requests.get(
-            f"https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses={address}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true",
-            headers=headers, timeout=12
-        )
-        if r.status_code == 200:
-            data = r.json()
-            if address.lower() in data:
-                d = data[address.lower()]
-                final_sym = sym or address[:6].upper()
-                final_name = name or final_sym
-                return {
-                    "baseToken": {"symbol": final_sym, "name": final_name},
-                    "priceUsd": str(d.get("usd", 0)),
-                    "priceChange": {"h1": "0", "h24": str(d.get("usd_24h_change", 0))},
-                    "volume": {"h24": str(d.get("usd_24h_vol", 0))},
-                    "liquidity": {"usd": "0"},
-                    "marketCap": str(d.get("usd_market_cap", 0)),
-                    "dexId": "COINGECKO",
-                    "url": f"https://www.coingecko.com/en/coins/{address}",
-                    "info": {"imageUrl": logo}
-                }
-    except: pass
-
-    # ── 4. Try Pump.fun ──
+    # ── 3. Pump.fun ──
     try:
         r = requests.get(f"https://frontend-api.pump.fun/coins/{address}", headers=headers, timeout=12)
         if r.status_code == 200:
             d = r.json()
-            if d:
+            if d and (d.get("usd_market_cap") or d.get("virtual_sol_reserves")):
                 final_sym = sym or d.get("symbol", address[:6].upper())
                 final_name = name or d.get("name", final_sym)
                 final_logo = logo or d.get("image_uri", "")
+                mcap = d.get("usd_market_cap", 0)
+                # Calculate price from market cap and total supply
+                supply = d.get("total_supply", 1)
+                price = (float(mcap) / float(supply)) if supply and mcap else 0
                 return {
                     "baseToken": {"symbol": final_sym, "name": final_name},
-                    "priceUsd": "0",
+                    "priceUsd": str(price),
                     "priceChange": {"h1": "0", "h24": "0"},
                     "volume": {"h24": "0"},
-                    "liquidity": {"usd": "0"},
-                    "marketCap": str(d.get("usd_market_cap", 0)),
+                    "liquidity": {"usd": str(d.get("virtual_sol_reserves", 0))},
+                    "marketCap": str(mcap),
                     "dexId": "PUMPFUN",
                     "url": f"https://pump.fun/{address}",
                     "info": {"imageUrl": final_logo}
                 }
     except: pass
 
-    # ── 5. Return basic info if we at least have metadata ──
+    # ── 4. Return metadata only if available ──
     if sym:
         return {
             "baseToken": {"symbol": sym, "name": name},
-            "priceUsd": "0",
-            "priceChange": {"h1": "0", "h24": "0"},
-            "volume": {"h24": "0"},
-            "liquidity": {"usd": "0"},
-            "marketCap": "0",
-            "dexId": "UNKNOWN",
+            "priceUsd": "0", "priceChange": {"h1": "0", "h24": "0"},
+            "volume": {"h24": "0"}, "liquidity": {"usd": "0"},
+            "marketCap": "0", "dexId": "UNKNOWN",
             "url": f"https://solscan.io/token/{address}",
             "info": {"imageUrl": logo}
         }
