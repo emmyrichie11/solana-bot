@@ -224,6 +224,7 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # Token helpers
 # ─────────────────────────────────────────────
 
+
 def get_token_metadata(address):
     """Fetch token symbol, name and logo from Jupiter (most reliable)"""
     import random
@@ -233,7 +234,7 @@ def get_token_metadata(address):
     ])
     headers = {"User-Agent": ua, "Accept": "application/json"}
 
-    # 1. Jupiter token API (most reliable, no blocking)
+    # 1. Jupiter token API
     try:
         r = requests.get(f"https://tokens.jup.ag/token/{address}", headers=headers, timeout=8)
         if r.status_code == 200:
@@ -269,7 +270,7 @@ def get_token_metadata(address):
 
 def get_token_info(address):
     """Fetch token price info - tries multiple APIs"""
-    import random, time
+    import random
 
     ua = random.choice([
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -278,7 +279,7 @@ def get_token_info(address):
     ])
     headers = {"User-Agent": ua, "Accept": "application/json"}
 
-    # Always fetch metadata first (Jupiter is reliable)
+    # Always fetch metadata first (Jupiter is reliable for name/symbol/logo)
     sym, name, logo = get_token_metadata(address)
 
     # ── 1. Try DexScreener ──
@@ -292,7 +293,6 @@ def get_token_info(address):
                 pairs = r.json().get("pairs")
                 if pairs:
                     p = sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
-                    # Override with reliable metadata if available
                     if sym:
                         p["baseToken"]["symbol"] = sym
                         p["baseToken"]["name"] = name
@@ -313,27 +313,54 @@ def get_token_info(address):
             if pools:
                 pool = pools[0]
                 attrs = pool.get("attributes", {})
-                # Use metadata for reliable symbol/name
                 final_sym = sym or attrs.get("base_token_symbol") or address[:6].upper()
-                final_name = name or attrs.get("name") or final_sym
+                final_name = name or final_sym
                 final_logo = logo or ""
+                price = attrs.get("base_token_price_usd") or "0"
+                mcap = attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0"
+                vol = attrs.get("volume_usd", {}).get("h24") or "0"
+                liq = attrs.get("reserve_in_usd") or "0"
+                h24 = attrs.get("price_change_percentage", {}).get("h24") or "0"
+                h1 = attrs.get("price_change_percentage", {}).get("h1") or "0"
                 return {
                     "baseToken": {"symbol": final_sym, "name": final_name},
-                    "priceUsd": str(attrs.get("base_token_price_usd") or "0"),
-                    "priceChange": {
-                        "h1": str(attrs.get("price_change_percentage", {}).get("h1") or "0"),
-                        "h24": str(attrs.get("price_change_percentage", {}).get("h24") or "0"),
-                    },
-                    "volume": {"h24": str(attrs.get("volume_usd", {}).get("h24") or "0")},
-                    "liquidity": {"usd": str(attrs.get("reserve_in_usd") or "0")},
-                    "marketCap": str(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0"),
+                    "priceUsd": str(price),
+                    "priceChange": {"h1": str(h1), "h24": str(h24)},
+                    "volume": {"h24": str(vol)},
+                    "liquidity": {"usd": str(liq)},
+                    "marketCap": str(mcap),
                     "dexId": pool.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "DEX"),
                     "url": f"https://www.geckoterminal.com/solana/pools/{pool.get('id','')}",
                     "info": {"imageUrl": final_logo}
                 }
     except: pass
 
-    # ── 3. Try Pump.fun ──
+    # ── 3. Try CoinGecko ──
+    try:
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses={address}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true",
+            headers=headers, timeout=12
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if address.lower() in data:
+                d = data[address.lower()]
+                final_sym = sym or address[:6].upper()
+                final_name = name or final_sym
+                return {
+                    "baseToken": {"symbol": final_sym, "name": final_name},
+                    "priceUsd": str(d.get("usd", 0)),
+                    "priceChange": {"h1": "0", "h24": str(d.get("usd_24h_change", 0))},
+                    "volume": {"h24": str(d.get("usd_24h_vol", 0))},
+                    "liquidity": {"usd": "0"},
+                    "marketCap": str(d.get("usd_market_cap", 0)),
+                    "dexId": "COINGECKO",
+                    "url": f"https://www.coingecko.com/en/coins/{address}",
+                    "info": {"imageUrl": logo}
+                }
+    except: pass
+
+    # ── 4. Try Pump.fun ──
     try:
         r = requests.get(f"https://frontend-api.pump.fun/coins/{address}", headers=headers, timeout=12)
         if r.status_code == 200:
@@ -355,7 +382,7 @@ def get_token_info(address):
                 }
     except: pass
 
-    # ── 4. If we at least have metadata, return basic info ──
+    # ── 5. Return basic info if we at least have metadata ──
     if sym:
         return {
             "baseToken": {"symbol": sym, "name": name},
