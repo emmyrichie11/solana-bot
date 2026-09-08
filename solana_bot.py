@@ -29,6 +29,12 @@ PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698}
 waiting_for_wallet = {}
 waiting_for_pnl = {}
 
+# Token data cache. This prevents repeated API calls for the same CA from
+# causing transient failures/rate limits between scan -> PnL -> refresh.
+token_cache = {}
+TOKEN_CACHE_TTL = 90
+TOKEN_STALE_TTL = 900
+
 # ─────────────────────────────────────────────
 # Admin notification
 # ─────────────────────────────────────────────
@@ -269,8 +275,19 @@ def get_token_metadata(address):
 
 
 def get_token_info(address):
-    """Fetch token price info - tries multiple APIs"""
+    """Fetch token price info with caching and multiple fallbacks."""
     import random
+    import time
+
+    address = address.strip()
+    cache_key = address.lower()
+    now = time.time()
+
+    cached = token_cache.get(cache_key)
+    if cached:
+        cached_pair, cached_at = cached
+        if now - cached_at <= TOKEN_CACHE_TTL:
+            return cached_pair
 
     ua = random.choice([
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
@@ -279,63 +296,82 @@ def get_token_info(address):
     ])
     headers = {"User-Agent": ua, "Accept": "application/json"}
 
-    # Metadata is optional. A metadata-only response must never be treated as
-    # a valid market-data result.
-    sym, name, logo = get_token_metadata(address)
+    def save_pair(pair):
+        if pair:
+            token_cache[cache_key] = (pair, time.time())
+        return pair
 
-    # ── 1. Try DexScreener ──
-    for url in [
+    # ── 1. DexScreener chain-scoped token endpoint ──
+    # This is the primary source. It directly asks for this Solana CA instead
+    # of doing a broad search that can return an unrelated token.
+    dex_urls = [
+        f"https://api.dexscreener.com/tokens/v1/solana/{address}",
+        f"https://api.dexscreener.com/token-pairs/v1/solana/{address}",
         f"https://api.dexscreener.com/latest/dex/tokens/{address}",
-        f"https://api.dexscreener.com/latest/dex/search?q={address}",
-    ]:
-        try:
-            r = requests.get(url, headers=headers, timeout=12)
-            if r.status_code == 200:
-                pairs = r.json().get("pairs")
-                if pairs:
-                    valid_pairs = [
-                        p for p in pairs
-                        if (p.get("baseToken") or {}).get("address", "").lower() == address.lower()
-                    ]
-                    if valid_pairs:
-                        p = sorted(
-                            valid_pairs,
-                            key=lambda x: float(x.get("liquidity",{}).get("usd",0) or 0),
-                            reverse=True
-                        )[0]
-                        if sym:
-                            p["baseToken"]["symbol"] = sym
-                        if name:
-                            p["baseToken"]["name"] = name
-                        if logo and not (p.get("info") or {}).get("imageUrl"):
-                            p.setdefault("info", {})["imageUrl"] = logo
-                        return p
-        except: pass
+    ]
 
-    # ── 2. Try GeckoTerminal pools ──
+    for url in dex_urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                continue
+
+            payload = r.json()
+            pairs = payload if isinstance(payload, list) else payload.get("pairs") or []
+
+            valid_pairs = [
+                p for p in pairs
+                if (p.get("chainId") or "").lower() == "solana"
+                and (p.get("baseToken") or {}).get("address", "").lower() == cache_key
+            ]
+
+            if valid_pairs:
+                p = sorted(
+                    valid_pairs,
+                    key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0),
+                    reverse=True
+                )[0]
+
+                # DexScreener already supplies the token identity. Only use
+                # Jupiter metadata to fill a genuinely missing field.
+                base = p.setdefault("baseToken", {})
+                if not base.get("symbol") or not base.get("name"):
+                    sym, name, logo = get_token_metadata(address)
+                    if sym and not base.get("symbol"):
+                        base["symbol"] = sym
+                    if name and not base.get("name"):
+                        base["name"] = name
+                    if logo and not (p.get("info") or {}).get("imageUrl"):
+                        p.setdefault("info", {})["imageUrl"] = logo
+
+                if base.get("symbol") and base.get("name"):
+                    return save_pair(p)
+        except:
+            pass
+
+    # ── 2. GeckoTerminal pools ──
     try:
         r = requests.get(
             f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1",
             headers={"Accept": "application/json;version=20230302", "User-Agent": ua},
-            timeout=12
+            timeout=10
         )
         if r.status_code == 200:
             pools = r.json().get("data", [])
             if pools:
                 pool = pools[0]
                 attrs = pool.get("attributes", {})
-                final_sym = sym or attrs.get("base_token_symbol")
-                final_name = name or final_sym
-                final_logo = logo or ""
-                if final_sym and final_name:
+                sym = attrs.get("base_token_symbol")
+                name = attrs.get("name") or sym
+                if sym and name:
                     price = attrs.get("base_token_price_usd") or "0"
                     mcap = attrs.get("market_cap_usd") or attrs.get("fdv_usd") or "0"
                     vol = attrs.get("volume_usd", {}).get("h24") or "0"
                     liq = attrs.get("reserve_in_usd") or "0"
                     h24 = attrs.get("price_change_percentage", {}).get("h24") or "0"
                     h1 = attrs.get("price_change_percentage", {}).get("h1") or "0"
-                    return {
-                        "baseToken": {"symbol": final_sym, "name": final_name},
+                    return save_pair({
+                        "baseToken": {"symbol": sym, "name": name, "address": address},
                         "priceUsd": str(price),
                         "priceChange": {"h1": str(h1), "h24": str(h24)},
                         "volume": {"h24": str(vol)},
@@ -343,45 +379,31 @@ def get_token_info(address):
                         "marketCap": str(mcap),
                         "dexId": pool.get("relationships", {}).get("dex", {}).get("data", {}).get("id", "DEX"),
                         "url": f"https://www.geckoterminal.com/solana/pools/{pool.get('id','')}",
-                        "info": {"imageUrl": final_logo}
-                    }
-    except: pass
+                        "info": {"imageUrl": ""}
+                    })
+    except:
+        pass
 
-    # ── 3. Try CoinGecko ──
+    # ── 3. Pump.fun ──
     try:
         r = requests.get(
-            f"https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses={address}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true",
-            headers=headers, timeout=12
+            f"https://frontend-api.pump.fun/coins/{address}",
+            headers=headers,
+            timeout=10
         )
-        if r.status_code == 200:
-            data = r.json()
-            if address.lower() in data and sym and name:
-                d = data[address.lower()]
-                return {
-                    "baseToken": {"symbol": sym, "name": name},
-                    "priceUsd": str(d.get("usd", 0)),
-                    "priceChange": {"h1": "0", "h24": str(d.get("usd_24h_change", 0))},
-                    "volume": {"h24": str(d.get("usd_24h_vol", 0))},
-                    "liquidity": {"usd": "0"},
-                    "marketCap": str(d.get("usd_market_cap", 0)),
-                    "dexId": "COINGECKO",
-                    "url": f"https://www.coingecko.com/en/coins/{address}",
-                    "info": {"imageUrl": logo}
-                }
-    except: pass
-
-    # ── 4. Try Pump.fun ──
-    try:
-        r = requests.get(f"https://frontend-api.pump.fun/coins/{address}", headers=headers, timeout=12)
         if r.status_code == 200:
             d = r.json()
             if d:
-                final_sym = sym or d.get("symbol")
-                final_name = name or d.get("name")
-                final_logo = logo or d.get("image_uri", "")
+                final_sym = d.get("symbol")
+                final_name = d.get("name")
+                final_logo = d.get("image_uri", "")
                 if final_sym and final_name:
-                    return {
-                        "baseToken": {"symbol": final_sym, "name": final_name},
+                    return save_pair({
+                        "baseToken": {
+                            "symbol": final_sym,
+                            "name": final_name,
+                            "address": address
+                        },
                         "priceUsd": "0",
                         "priceChange": {"h1": "0", "h24": "0"},
                         "volume": {"h24": "0"},
@@ -390,11 +412,45 @@ def get_token_info(address):
                         "dexId": "PUMPFUN",
                         "url": f"https://pump.fun/{address}",
                         "info": {"imageUrl": final_logo}
-                    }
-    except: pass
+                    })
+    except:
+        pass
+
+    # ── 4. CoinGecko ──
+    try:
+        sym, name, logo = get_token_metadata(address)
+        if sym and name:
+            r = requests.get(
+                f"https://api.coingecko.com/api/v3/simple/token_price/solana?contract_addresses={address}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true",
+                headers=headers,
+                timeout=10
+            )
+            if r.status_code == 200:
+                data = r.json()
+                if address.lower() in data:
+                    d = data[address.lower()]
+                    return save_pair({
+                        "baseToken": {"symbol": sym, "name": name, "address": address},
+                        "priceUsd": str(d.get("usd", 0)),
+                        "priceChange": {"h1": "0", "h24": str(d.get("usd_24h_change", 0))},
+                        "volume": {"h24": str(d.get("usd_24h_vol", 0))},
+                        "liquidity": {"usd": "0"},
+                        "marketCap": str(d.get("usd_market_cap", 0)),
+                        "dexId": "COINGECKO",
+                        "url": f"https://www.coingecko.com/en/coins/{address}",
+                        "info": {"imageUrl": logo}
+                    })
+    except:
+        pass
+
+    # If an API temporarily fails, use recently successful data for this CA
+    # instead of incorrectly reporting that the token does not exist.
+    if cached:
+        cached_pair, cached_at = cached
+        if now - cached_at <= TOKEN_STALE_TTL:
+            return cached_pair
 
     return None
-
 
 def format_number(n):
     try:
@@ -564,8 +620,10 @@ async def button_handler(update, context):
         if not can_pnl:
             await query.message.reply_text("🔒 *PnL Card is for selected users only.*", parse_mode="Markdown")
             return
-        address = data.split(":")[1]
+        address = data.split(":", 1)[1]
         pair = get_token_info(address)
+        if not pair:
+            pair = context.user_data.get("last_token_pairs", {}).get(address.lower())
         if pair:
             base_token = pair.get("baseToken", {})
             name = base_token.get("name") or "Unknown"
@@ -632,6 +690,7 @@ async def button_handler(update, context):
         pair = get_token_info(address)
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
+            context.user_data.setdefault("last_token_pairs", {})[address.lower()] = pair
             await query.message.edit_text(
                 build_token_message(pair), parse_mode="Markdown",
                 reply_markup=token_keyboard(symbol, address),
@@ -716,6 +775,7 @@ async def handle_message(update, context):
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
             await notify_admin(context, user, f"🔍 Scanned: {symbol}", text)
+            context.user_data.setdefault("last_token_pairs", {})[text.lower()] = pair
             await update.message.reply_text(
                 build_token_message(pair), parse_mode="Markdown",
                 reply_markup=token_keyboard(symbol, text),
