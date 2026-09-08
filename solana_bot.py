@@ -349,7 +349,37 @@ def get_token_info(address):
         except:
             pass
 
-    # ── 2. GeckoTerminal pools ──
+    # ── 2. DexScreener exact-address search fallback ──
+    # Some tokens are returned by DexScreener's search endpoint even when
+    # the chain-scoped token endpoints temporarily return no matching pair.
+    # Keep the address match strict so an unrelated token can never be used.
+    try:
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/search?q={address}",
+            headers=headers,
+            timeout=10
+        )
+        if r.status_code == 200:
+            payload = r.json()
+            pairs = payload.get("pairs") or []
+            valid_pairs = [
+                p for p in pairs
+                if (p.get("chainId") or "").lower() == "solana"
+                and (p.get("baseToken") or {}).get("address", "").lower() == cache_key
+            ]
+            if valid_pairs:
+                p = sorted(
+                    valid_pairs,
+                    key=lambda x: float((x.get("liquidity") or {}).get("usd", 0) or 0),
+                    reverse=True
+                )[0]
+                base = p.setdefault("baseToken", {})
+                if base.get("symbol") and base.get("name"):
+                    return save_pair(p)
+    except:
+        pass
+
+    # ── 3. GeckoTerminal pools ──
     try:
         r = requests.get(
             f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{address}/pools?page=1",
@@ -384,7 +414,7 @@ def get_token_info(address):
     except:
         pass
 
-    # ── 3. Pump.fun ──
+    # ── 4. Pump.fun ──
     try:
         r = requests.get(
             f"https://frontend-api.pump.fun/coins/{address}",
@@ -416,7 +446,7 @@ def get_token_info(address):
     except:
         pass
 
-    # ── 4. CoinGecko ──
+    # ── 5. CoinGecko ──
     try:
         sym, name, logo = get_token_metadata(address)
         if sym and name:
@@ -523,7 +553,7 @@ def is_valid_solana_address(text):
             value = value * 58 + alphabet.index(char)
         raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
         leading_ones = len(text) - len(text.lstrip("1"))
-        raw = b"\\x00" * leading_ones + raw
+        raw = b"\x00" * leading_ones + raw
         return len(raw) == 32
     except:
         return False
@@ -621,9 +651,9 @@ async def button_handler(update, context):
             await query.message.reply_text("🔒 *PnL Card is for selected users only.*", parse_mode="Markdown")
             return
         address = data.split(":", 1)[1]
-        pair = get_token_info(address)
+        pair = context.user_data.get("last_token_pairs", {}).get(address.lower())
         if not pair:
-            pair = context.user_data.get("last_token_pairs", {}).get(address.lower())
+            pair = get_token_info(address)
         if pair:
             base_token = pair.get("baseToken", {})
             name = base_token.get("name") or "Unknown"
@@ -771,7 +801,9 @@ async def handle_message(update, context):
 
     if is_valid_solana_address(text):
         await update.message.reply_text("🔍 Scanning token...")
-        pair = get_token_info(text)
+        pair = context.user_data.get("last_token_pairs", {}).get(text.lower())
+        if not pair:
+            pair = get_token_info(text)
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
             await notify_admin(context, user, f"🔍 Scanned: {symbol}", text)
