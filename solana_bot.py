@@ -20,6 +20,14 @@ from telegram.ext import (
 
 # ─────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+# ScraperAPI key
+# Prefer the SCRAPER_API_KEY environment variable in production.
+SCRAPER_API_KEY = os.environ.get(
+    "SCRAPER_API_KEY",
+    "cdda3a2d6642f140cb67cf3fafd07d0e"
+)
+
 BOT_NAME = "ApeRadarX"
 ADMIN_ID = 1495066761
 PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698}
@@ -223,6 +231,14 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap, username
 # ─────────────────────────────────────────────
 # Token helpers
 # ─────────────────────────────────────────────
+
+
+def scraperapi_get(url, **kwargs):
+    """GET a URL through ScraperAPI when a key is configured."""
+    params = kwargs.pop("params", {}) or {}
+    params["api_key"] = SCRAPER_API_KEY
+    params["url"] = url
+    return requests.get("https://api.scraperapi.com", params=params, **kwargs)
 
 
 def get_token_metadata(address):
