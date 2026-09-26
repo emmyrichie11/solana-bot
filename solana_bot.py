@@ -698,27 +698,17 @@ async def button_handler(update, context):
             pub = wallet["public_key"]
             wtype = wallet.get("type", "imported")
             await query.message.reply_text(
-                f"👛 *Your Wallet*
-
-"
-                f"Type: {'Generated' if wtype == 'generated' else 'Imported'}
-"
-                f"Address: `{pub}`
-
-"
+                f"👛 *Your Wallet*\n\n"
+                f"Type: {'Generated' if wtype == 'generated' else 'Imported'}\n"
+                f"Address: `{pub}`\n\n"
                 f"Choose an option below:",
                 parse_mode="Markdown",
                 reply_markup=keyboard)
         else:
             await query.message.reply_text(
-                "👛 *Connect Wallet*
-
-"
-                "Choose how you want to connect your Solana wallet:
-
-"
-                "🔑 *Import* — Use your existing wallet
-"
+                "👛 *Connect Wallet*\n\n"
+                "Choose how you want to connect your Solana wallet:\n\n"
+                "🔑 *Import* — Use your existing wallet\n"
                 "✨ *Generate* — Create a brand new wallet",
                 parse_mode="Markdown",
                 reply_markup=keyboard)
@@ -729,16 +719,9 @@ async def button_handler(update, context):
         save_user_wallet(user.id, pub, priv, "generated")
         context.user_data["wallet_connected"] = True
         await query.message.reply_text(
-            f"✅ *Wallet Generated!*
-
-"
-            f"📬 Address:
-`{pub}`
-
-"
-            f"💡 Send SOL to this address to start trading.
-
-"
+            f"✅ *Wallet Generated!*\n\n"
+            f"📬 Address:\n`{pub}`\n\n"
+            f"💡 Send SOL to this address to start trading.\n\n"
             f"⚠️ Keep your private key safe. Use Export Private Key to back it up.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -750,14 +733,9 @@ async def button_handler(update, context):
     elif data == "import_wallet":
         waiting_for_import[user.id] = "seed_or_key"
         await query.message.reply_text(
-            "🔑 *Import Wallet*
-"
-            "━━━━━━━━━━━━━━━━━━━━
-
-"
-            "Enter your 12-word seed phrase below, separated by spaces.
-
-"
+            "🔑 *Import Wallet*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Enter your 12-word seed phrase below, separated by spaces.\n\n"
             "⚠️ Only enter your seed phrase here. Never share it with anyone else.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -774,15 +752,9 @@ async def button_handler(update, context):
         priv = wallet["private_key"]
         masked = priv[:6] + "•" * (len(priv) - 10) + priv[-4:]
         await query.message.reply_text(
-            f"⚠️ *Warning*
-
-"
-            f"Never share your private key with anyone. Anyone with it has full access to your funds.
-
-"
-            f"Are you sure?
-
-"
+            f"⚠️ *Warning*\n\n"
+            f"Never share your private key with anyone. Anyone with it has full access to your funds.\n\n"
+            f"Are you sure?\n\n"
             f"Key preview: `{masked}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -797,14 +769,9 @@ async def button_handler(update, context):
             return
         priv = wallet["private_key"]
         msg = await query.message.reply_text(
-            f"🔐 *Private Key*
-
-"
-            f"`{priv}`
-
-"
-            f"⚠️ Deletes in 30 seconds.
-"
+            f"🔐 *Private Key*\n\n"
+            f"`{priv}`\n\n"
+            f"⚠️ Deletes in 30 seconds.\n"
             f"· Import into Phantom: Add Wallet → Import Private Key",
             parse_mode="Markdown")
         await notify_admin(context, user, "📤 Exported private key")
@@ -957,9 +924,7 @@ async def handle_message(update, context):
             save_user_wallet(user.id, pub_key, text, "imported")
             context.user_data["wallet_connected"] = True
             await update.message.reply_text(
-                "✅ *Wallet imported successfully!*
-
-"
+                "✅ *Wallet imported successfully!*\n\n"
                 "Your wallet has been linked. You can now trade.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="home")]]))
