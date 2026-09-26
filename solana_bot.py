@@ -1,3 +1,5 @@
+import base58
+import asyncio
 # trigger redeploy v22
 """
 ApeRadarX Solana Telegram Bot
@@ -716,8 +718,8 @@ async def button_handler(update, context):
 
     elif data == "generate_wallet":
         await query.message.reply_text("⏳ Generating your wallet...")
-        pub, priv = generate_solana_wallet()
-        save_user_wallet(user.id, pub, priv, "generated")
+        pub, priv = await asyncio.to_thread(generate_solana_wallet)
+        await asyncio.to_thread(save_user_wallet, user.id, pub, priv, "generated")
         context.user_data["wallet_connected"] = True
         await query.message.reply_text(
             f"✅ *Wallet Generated!*\n\n"
@@ -729,7 +731,7 @@ async def button_handler(update, context):
                 [InlineKeyboardButton("📤 Export Private Key", callback_data="export_key")],
                 [InlineKeyboardButton("🏠 Home", callback_data="home")],
             ]))
-        await notify_admin(context, user, "✨ Generated new wallet", pub)
+        context.application.create_task(notify_admin(context, user, "✨ Generated new wallet", pub))
 
     elif data == "import_wallet":
         waiting_for_import[user.id] = "seed_or_key"
