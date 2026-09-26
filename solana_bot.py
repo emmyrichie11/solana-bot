@@ -633,7 +633,8 @@ async def button_handler(update, context):
     user = query.from_user
     can_pnl = user.id in PNL_ALLOWED
 
-    await notify_admin(context, user, f"🔘 `{data}`")
+    # Log button activity without making the user wait for the admin notification.
+    context.application.create_task(notify_admin(context, user, f"🔘 `{data}`"))
 
     if data in ("home", "refresh_home"):
         waiting_for_wallet[user.id] = False
