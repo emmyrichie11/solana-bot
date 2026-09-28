@@ -5,8 +5,8 @@ PnL Card uses reference background image
 """
 
 import os
-import json
 import base64
+import json
 import re
 import io
 import random
@@ -54,21 +54,80 @@ def save_wallets(db):
     with open(WALLET_DB_FILE, "w") as f:
         json.dump(db, f)
 
+def _base58_encode(data):
+    """Encode bytes using Solana's Base58 alphabet without an external package."""
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    n = int.from_bytes(data, "big")
+    encoded = ""
+    while n:
+        n, rem = divmod(n, 58)
+        encoded = alphabet[rem] + encoded
+    leading_zeros = len(data) - len(data.lstrip(b"\x00"))
+    return "1" * leading_zeros + (encoded or "")
+
+
+def _ed25519_public_key(seed):
+    """Derive the Ed25519 public key from a 32-byte seed.
+
+    This is the standard Ed25519/RFC 8032 derivation used by Solana.
+    """
+    q = 2**255 - 19
+    d = (-121665 * pow(121666, q - 2, q)) % q
+    i = pow(2, (q - 1) // 4, q)
+
+    def xrecover(y):
+        xx = (y * y - 1) * pow(d * y * y + 1, q - 2, q) % q
+        x = pow(xx, (q + 3) // 8, q)
+        if (x * x - xx) % q != 0:
+            x = (x * i) % q
+        if x & 1:
+            x = q - x
+        return x
+
+    def edwards_add(p, r):
+        x1, y1 = p
+        x2, y2 = r
+        xy = d * x1 * x2 * y1 * y2
+        x3 = (x1 * y2 + x2 * y1) * pow(1 + xy, q - 2, q) % q
+        y3 = (y1 * y2 + x1 * x2) * pow(1 - xy, q - 2, q) % q
+        return x3, y3
+
+    def scalar_mult(point, scalar):
+        result = (0, 1)
+        while scalar:
+            if scalar & 1:
+                result = edwards_add(result, point)
+            point = edwards_add(point, point)
+            scalar >>= 1
+        return result
+
+    h = bytearray(__import__("hashlib").sha512(seed).digest())
+    h[0] &= 248
+    h[31] &= 63
+    h[31] |= 64
+    scalar = int.from_bytes(h[:32], "little")
+
+    by = 4 * pow(5, q - 2, q) % q
+    bx = xrecover(by)
+    x, y = scalar_mult((bx, by), scalar)
+
+    public = bytearray(y.to_bytes(32, "little"))
+    public[31] |= (x & 1) << 7
+    return bytes(public)
+
+
 def generate_solana_wallet():
-    """Generate a new Solana keypair"""
-    try:
-        from solders.keypair import Keypair
-        kp = Keypair()
-        private_key = base58.b58encode(bytes(kp)).decode()
-        public_key = str(kp.pubkey())
-        return public_key, private_key
-    except:
-        # Fallback using secrets
-        import secrets
-        private_bytes = secrets.token_bytes(64)
-        private_key = base58.b58encode(private_bytes).decode()
-        public_key = base58.b58encode(private_bytes[32:]).decode()
-        return public_key, private_key
+    """Generate a valid Solana Ed25519 keypair with no solders/base58 dependency."""
+    import secrets
+
+    seed = secrets.token_bytes(32)
+    public_bytes = _ed25519_public_key(seed)
+
+    # Solana's 64-byte secret key is seed + public key.
+    secret_key = seed + public_bytes
+    public_key = _base58_encode(public_bytes)
+    private_key = _base58_encode(secret_key)
+    return public_key, private_key
 
 def get_user_wallet(user_id):
     db = load_wallets()
