@@ -811,11 +811,22 @@ async def button_handler(update, context):
             return
         priv = wallet["private_key"]
         masked = priv[:6] + "•" * (len(priv) - 10) + priv[-4:]
-        await query.message.reply_text(
-            f"⚠️ *Warning*\n\n"
-            f"Never share your private key with anyone. Anyone with it has full access to your funds.\n\n"
-            f"Are you sure?\n\n"
-            f"Key preview: `{masked}`",
+
+        # Remove the previous wallet/generated-wallet message immediately
+        # before showing the private-key warning.
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"⚠️ *Warning*\n\n"
+                f"Never share your private key with anyone. Anyone with it has full access to your funds.\n\n"
+                f"Are you sure?\n\n"
+                f"Key preview: `{masked}`"
+            ),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Show Me", callback_data="reveal_key"),
@@ -828,18 +839,28 @@ async def button_handler(update, context):
             await query.message.reply_text("❌ No wallet found.")
             return
         priv = wallet["private_key"]
-        msg = await query.message.reply_text(
-            f"🔐 *Private Key*\n\n"
-            f"`{priv}`\n\n"
-            f"⚠️ Deletes in 30 seconds.\n"
-            f"· Import into Phantom: Add Wallet → Import Private Key",
+
+        # Remove the warning/confirmation message immediately.
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        msg = await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                f"🔐 *Private Key*\n\n"
+                f"`{priv}`\n\n"
+                f"⚠️ Deletes in 30 seconds.\n"
+                f"· Import into Phantom: Add Wallet → Import Private Key"
+            ),
             parse_mode="Markdown")
         await notify_admin(context, user, "📤 Exported private key")
-        # Auto delete after 30 seconds
+        # Auto delete the private key after 30 seconds.
         await asyncio.sleep(30)
         try:
             await msg.delete()
-        except:
+        except Exception:
             pass
 
     elif data == "claim_token":
@@ -860,7 +881,12 @@ async def button_handler(update, context):
 
     elif data == "help":
         await query.message.reply_text(
-            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu",
+            f"❓ *Help*\n\n"
+            f"🔍 Paste Solana token address\n"
+            f"📊 PnL Card — selected users\n"
+            f"👛 Connect Wallet\n"
+            f"🆘 Customer Support: aperadarxcustomersupport@gmail.com\n"
+            f"/start — Main menu",
             parse_mode="Markdown")
 
     elif data.startswith("buy:"):
