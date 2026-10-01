@@ -748,11 +748,16 @@ async def button_handler(update, context):
         if not get_user_wallet(user.id):
             await query.answer("Connect a wallet first.", show_alert=True)
             return
+
         await query.message.reply_text(
-            "🤖 *AI Mode*\n\n"
-            "AI Mode is ready for setup.",
+            "🤖 *AI Target Trading*\\n\\n"
+            "Trade with an AI-assisted target system built for focused, disciplined trading sessions.\\n\\n"
+            "Set a target, trade toward it, and track your progress in real time - same tools, same speed, sharper focus.\\n\\n"
+            "*1 Year Access - 2.5 SOL*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Subscribe - 2.5 SOL", callback_data="ai_subscribe")],
+                [InlineKeyboardButton("🔑 Active License", callback_data="ai_license")],
                 [InlineKeyboardButton("🔙 Back", callback_data="home")]
             ])
         )
