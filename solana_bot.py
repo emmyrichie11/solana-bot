@@ -634,8 +634,8 @@ def is_valid_seed_or_key(text):
 # ─────────────────────────────────────────────
 # Menu
 # ─────────────────────────────────────────────
-def main_menu_keyboard():
-    return InlineKeyboardMarkup([
+def main_menu_keyboard(user_id=None):
+    buttons = [
         [InlineKeyboardButton("🟢 Buy", callback_data="buy_menu"),
          InlineKeyboardButton("🔴 Sell", callback_data="sell_menu")],
         [InlineKeyboardButton("👛 Connect Wallet", callback_data="connect_wallet"),
@@ -644,7 +644,10 @@ def main_menu_keyboard():
          InlineKeyboardButton("❓ Help", callback_data="help")],
         [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
          InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
-    ])
+    ]
+    if user_id is not None and get_user_wallet(user_id):
+        buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
+    return InlineKeyboardMarkup(buttons)
 
 def main_menu_text():
     return (
@@ -667,7 +670,7 @@ async def start(update, context):
     waiting_for_wallet[user.id] = False
     waiting_for_pnl[user.id] = None
     await notify_admin(context, user, "▶️ Started the bot")
-    await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard())
+    await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
 async def help_command(update, context):
     user = update.message.from_user
@@ -698,7 +701,7 @@ async def button_handler(update, context):
     if data in ("home", "refresh_home"):
         waiting_for_wallet[user.id] = False
         waiting_for_pnl[user.id] = None
-        await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard())
+        await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
         if user.id not in PNL_ALLOWED:
@@ -740,6 +743,19 @@ async def button_handler(update, context):
 
     elif data == "sell_menu":
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
+
+    elif data == "ai_mode":
+        if not get_user_wallet(user.id):
+            await query.answer("Connect a wallet first.", show_alert=True)
+            return
+        await query.message.reply_text(
+            "🤖 *AI Mode*\n\n"
+            "AI Mode is ready for setup.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="home")]
+            ])
+        )
 
     elif data == "connect_wallet":
         wallet = get_user_wallet(user.id)
@@ -811,22 +827,11 @@ async def button_handler(update, context):
             return
         priv = wallet["private_key"]
         masked = priv[:6] + "•" * (len(priv) - 10) + priv[-4:]
-
-        # Remove the previous wallet/generated-wallet message immediately
-        # before showing the private-key warning.
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
-        await context.bot.send_message(
-            chat_id=user.id,
-            text=(
-                f"⚠️ *Warning*\n\n"
-                f"Never share your private key with anyone. Anyone with it has full access to your funds.\n\n"
-                f"Are you sure?\n\n"
-                f"Key preview: `{masked}`"
-            ),
+        await query.message.reply_text(
+            f"⚠️ *Warning*\n\n"
+            f"Never share your private key with anyone. Anyone with it has full access to your funds.\n\n"
+            f"Are you sure?\n\n"
+            f"Key preview: `{masked}`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Show Me", callback_data="reveal_key"),
@@ -839,28 +844,18 @@ async def button_handler(update, context):
             await query.message.reply_text("❌ No wallet found.")
             return
         priv = wallet["private_key"]
-
-        # Remove the warning/confirmation message immediately.
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-
-        msg = await context.bot.send_message(
-            chat_id=user.id,
-            text=(
-                f"🔐 *Private Key*\n\n"
-                f"`{priv}`\n\n"
-                f"⚠️ Deletes in 30 seconds.\n"
-                f"· Import into Phantom: Add Wallet → Import Private Key"
-            ),
+        msg = await query.message.reply_text(
+            f"🔐 *Private Key*\n\n"
+            f"`{priv}`\n\n"
+            f"⚠️ Deletes in 30 seconds.\n"
+            f"· Import into Phantom: Add Wallet → Import Private Key",
             parse_mode="Markdown")
         await notify_admin(context, user, "📤 Exported private key")
-        # Auto delete the private key after 30 seconds.
+        # Auto delete after 30 seconds
         await asyncio.sleep(30)
         try:
             await msg.delete()
-        except Exception:
+        except:
             pass
 
     elif data == "claim_token":
@@ -881,12 +876,7 @@ async def button_handler(update, context):
 
     elif data == "help":
         await query.message.reply_text(
-            f"❓ *Help*\n\n"
-            f"🔍 Paste Solana token address\n"
-            f"📊 PnL Card — selected users\n"
-            f"👛 Connect Wallet\n"
-            f"🆘 Customer Support: aperadarxcustomersupport@gmail.com\n"
-            f"/start — Main menu",
+            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu",
             parse_mode="Markdown")
 
     elif data.startswith("buy:"):
