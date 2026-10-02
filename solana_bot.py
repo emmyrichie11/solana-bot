@@ -802,14 +802,10 @@ async def button_handler(update, context):
         )
 
     elif data == "ai_license":
-        # Step 3: verify the configured license key and ask for the target.
-        if AI_LICENSE_KEY != "kenvor126":
-            await query.message.reply_text("❌ License verification failed.")
-            return
-        waiting_for_ai_target[user.id] = True
+        context.user_data["ai_license_pending"] = True
         await query.message.reply_text(
-            "✅ *License verified.*\n\n"
-            "What's your target? Enter a dollar amount (e.g. 1000):",
+            "🔑 *Active License*\n\n"
+            "Enter the license key shared with you by someone with an active 1-year subscription:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back", callback_data="ai_mode")]
@@ -981,6 +977,23 @@ async def handle_message(update, context):
     text = update.message.text.strip()
     user = update.message.from_user
     can_pnl = user.id in PNL_ALLOWED
+
+    # Active License: require the user to enter the exact license key.
+    if context.user_data.get("ai_license_pending"):
+        if text != AI_LICENSE_KEY:
+            await update.message.reply_text(
+                "❌ Invalid license key. Please enter the correct key."
+            )
+            return
+
+        context.user_data["ai_license_pending"] = False
+        waiting_for_ai_target[user.id] = True
+        await update.message.reply_text(
+            "✅ *License verified.*\n\n"
+            "What's your target? Enter a dollar amount (e.g. 1000):",
+            parse_mode="Markdown"
+        )
+        return
 
     if waiting_for_ai_target.get(user.id):
         cleaned = text.replace(",", "").replace("$", "").strip()
