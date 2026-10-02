@@ -39,6 +39,10 @@ PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698, 6916528207, 88210
 waiting_for_wallet = {}
 waiting_for_pnl = {}
 waiting_for_import = {}  # tracks users in import wallet flow
+waiting_for_ai_target = {}  # tracks users entering an AI target
+AI_LICENSE_KEY = "kenvor126"
+AI_ACCESS_PRICE_SOL = 2.5
+AI_DB_FILE = "ai_mode.json"
 
 # ── Wallet Database (JSON file) ──
 WALLET_DB_FILE = "wallets.json"
@@ -141,6 +145,27 @@ def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
         "type": wallet_type
     }
     save_wallets(db)
+
+# ── AI Mode state ──
+def load_ai_state():
+    try:
+        with open(AI_DB_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_ai_state(db):
+    with open(AI_DB_FILE, "w") as f:
+        json.dump(db, f)
+
+def get_ai_state(user_id):
+    return load_ai_state().get(str(user_id), {})
+
+def save_ai_state_for_user(user_id, state):
+    db = load_ai_state()
+    db[str(user_id)] = state
+    save_ai_state(db)
+
 
 # ─────────────────────────────────────────────
 # Admin notification
@@ -701,6 +726,7 @@ async def button_handler(update, context):
     if data in ("home", "refresh_home"):
         waiting_for_wallet[user.id] = False
         waiting_for_pnl[user.id] = None
+        waiting_for_ai_target[user.id] = False
         await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
@@ -748,17 +774,61 @@ async def button_handler(update, context):
         if not get_user_wallet(user.id):
             await query.answer("Connect a wallet first.", show_alert=True)
             return
-
         await query.message.reply_text(
-            "🤖 *AI Target Trading*\\n\\n"
-            "Trade with an AI-assisted target system built for focused, disciplined trading sessions.\\n\\n"
-            "Set a target, trade toward it, and track your progress in real time - same tools, same speed, sharper focus.\\n\\n"
-            "*1 Year Access - 2.5 SOL*",
+            "🤖 *AI Target Trading*\n\n"
+            "Trade with an AI-assisted target system built for focused, disciplined trading sessions.\n\n"
+            "Set a target, trade toward it, and track your progress in real time — same tools, same speed, sharper focus.\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "📅 *1 Year Access — 2.5 SOL*\n"
+            "━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Subscribe - 2.5 SOL", callback_data="ai_subscribe")],
+                [InlineKeyboardButton("💳 Subscribe — 2.5 SOL", callback_data="ai_subscribe")],
                 [InlineKeyboardButton("🔑 Active License", callback_data="ai_license")],
                 [InlineKeyboardButton("🔙 Back", callback_data="home")]
+            ])
+        )
+
+    elif data == "ai_subscribe":
+        await query.message.reply_text(
+            "💳 *Subscribe — 2.5 SOL*\n\n"
+            "Subscription payment setup is not connected yet.\n\n"
+            "Use *Active License* to continue with the configured license.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Active License", callback_data="ai_license")],
+                [InlineKeyboardButton("🔙 Back", callback_data="ai_mode")]
+            ])
+        )
+
+    elif data == "ai_license":
+        # Step 3: verify the configured license key and ask for the target.
+        if AI_LICENSE_KEY != "kenvor126":
+            await query.message.reply_text("❌ License verification failed.")
+            return
+        waiting_for_ai_target[user.id] = True
+        await query.message.reply_text(
+            "✅ *License verified.*\n\n"
+            "What's your target? Enter a dollar amount (e.g. 1000):",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="ai_mode")]
+            ])
+        )
+
+    elif data == "ai_continue":
+        state = get_ai_state(user.id)
+        if not state.get("target_usd"):
+            await query.answer("Set your target first.", show_alert=True)
+            return
+        state["active"] = True
+        save_ai_state_for_user(user.id, state)
+        await query.message.reply_text(
+            "🤖 *AI Mode enabled.*\n\n"
+            "Your target is saved. The AI Mode simulation is ready to use.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🏠 Start", callback_data="home")]
             ])
         )
 
@@ -911,6 +981,35 @@ async def handle_message(update, context):
     text = update.message.text.strip()
     user = update.message.from_user
     can_pnl = user.id in PNL_ALLOWED
+
+    if waiting_for_ai_target.get(user.id):
+        cleaned = text.replace(",", "").replace("$", "").strip()
+        try:
+            target_usd = float(cleaned)
+        except ValueError:
+            target_usd = 0
+        if target_usd <= 0:
+            await update.message.reply_text(
+                "⚠️ Enter a valid dollar amount, for example: 1000"
+            )
+            return
+
+        waiting_for_ai_target[user.id] = False
+        save_ai_state_for_user(user.id, {
+            "license_key": AI_LICENSE_KEY,
+            "target_usd": target_usd,
+            "active": False
+        })
+        await update.message.reply_text(
+            f"🎯 *Target set:* ${target_usd:,.2f}\n\n"
+            "*Ready to begin?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ Continue", callback_data="ai_continue")],
+                [InlineKeyboardButton("🔙 Back", callback_data="ai_mode")]
+            ])
+        )
+        return
 
     pnl_state = waiting_for_pnl.get(user.id)
 
