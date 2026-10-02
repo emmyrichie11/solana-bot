@@ -5,7 +5,6 @@ PnL Card uses reference background image
 """
 
 import os
-import asyncio
 import base64
 import json
 import re
@@ -675,81 +674,18 @@ def main_menu_keyboard(user_id=None):
         buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
     return InlineKeyboardMarkup(buttons)
 
-SOLANA_RPC_URL = os.environ.get(
-    "SOLANA_RPC_URL",
-    "https://api.mainnet-beta.solana.com"
-)
-
-
-def get_sol_price_usd():
-    """Get the current SOL/USD price for display purposes."""
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "solana", "vs_currencies": "usd"},
-            timeout=8,
-        )
-        r.raise_for_status()
-        price = float(r.json().get("solana", {}).get("usd", 0) or 0)
-        return price if price > 0 else 0.0
-    except Exception:
-        return 0.0
-
-
-def get_wallet_balance_sol(user_id):
-    """Read the connected wallet's current SOL balance from Solana RPC."""
-    wallet = get_user_wallet(user_id)
-    if not wallet:
-        return 0.0
-
-    try:
-        r = requests.post(
-            SOLANA_RPC_URL,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "getBalance",
-                "params": [wallet["public_key"]],
-            },
-            timeout=8,
-        )
-        r.raise_for_status()
-        lamports = int(r.json().get("result", {}).get("value", 0) or 0)
-        return lamports / 1_000_000_000
-    except Exception:
-        return 0.0
-
-
-def escape_markdown_v2(text):
-    return re.sub(r'([_\\*\\[\\]()~`>#+\\-=|{}.!])', r'\\\\\\1', str(text))
-
-
-def main_menu_text(user_id=None, display_name="User"):
-    state = get_ai_state(user_id) if user_id is not None else {}
-    target_usd = float(state.get("target_usd", 0) or 0)
-
-    current_sol = get_wallet_balance_sol(user_id) if user_id is not None else 0.0
-    sol_price = get_sol_price_usd()
-    current_usd = current_sol * sol_price if sol_price else 0.0
-    target_sol = target_usd / sol_price if target_usd > 0 and sol_price else 0.0
-
-    safe_name = escape_markdown_v2(display_name or "User")
-
-    target_line = (
-        f"🎯 *Target Balance:* ${target_usd:,.2f} / {target_sol:,.4f} SOL"
-        if target_usd > 0
-        else "🎯 *Target Balance:* Not set"
-    )
-
+def main_menu_text():
     return (
-        f"👤 *{safe_name}*\\n\\n"
-        f"{target_line}\\n"
-        f"💰 *Wallet Balance:* ${current_usd:,.2f} / {current_sol:,.4f} SOL\\n"
-        "━━━━━━━━━━━━━━━━━\\n\\n"
-        "📋 *Paste a token contract address* to begin scanning\\.\\n\\n"
+        f"🦍 *Welcome to {BOT_NAME}\\!*\n\n"
+        "Track hot tokens, catch early movers, and trade with speed\\.\n\n"
+        "Built for apes, powered by real\\-time data, and designed to help "
+        "you find the next rocket before it takes off 🚀\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💰 *Wallet Balance:* 0\\.00 SOL\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "📋 *Paste a token contract address* to begin scanning\\.\n\n"
         "Use the buttons below to navigate\\."
     )
-
 
 # ─────────────────────────────────────────────
 # Commands
@@ -759,11 +695,7 @@ async def start(update, context):
     waiting_for_wallet[user.id] = False
     waiting_for_pnl[user.id] = None
     await notify_admin(context, user, "▶️ Started the bot")
-    await update.message.reply_text(
-        main_menu_text(user.id, user.full_name or (f"@{user.username}" if user.username else "User")),
-        parse_mode="MarkdownV2",
-        reply_markup=main_menu_keyboard(user.id)
-    )
+    await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
 async def help_command(update, context):
     user = update.message.from_user
@@ -795,11 +727,7 @@ async def button_handler(update, context):
         waiting_for_wallet[user.id] = False
         waiting_for_pnl[user.id] = None
         waiting_for_ai_target[user.id] = False
-        await query.message.reply_text(
-            main_menu_text(user.id, user.full_name or (f"@{user.username}" if user.username else "User")),
-            parse_mode="MarkdownV2",
-            reply_markup=main_menu_keyboard(user.id)
-        )
+        await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
         if user.id not in PNL_ALLOWED:
