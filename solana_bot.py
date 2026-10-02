@@ -167,6 +167,21 @@ def save_ai_state_for_user(user_id, state):
     save_ai_state(db)
 
 
+def get_ai_balance(user_id):
+    state = get_ai_state(user_id)
+    try:
+        return float(state.get("ai_balance_sol", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def set_ai_balance(user_id, balance_sol):
+    state = get_ai_state(user_id)
+    state["ai_balance_sol"] = max(0.0, float(balance_sol))
+    save_ai_state_for_user(user_id, state)
+    return state["ai_balance_sol"]
+
+
 # ─────────────────────────────────────────────
 # Admin notification
 # ─────────────────────────────────────────────
@@ -697,6 +712,21 @@ async def start(update, context):
     await notify_admin(context, user, "▶️ Started the bot")
     await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
+async def admin_command(update, context):
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        await update.message.reply_text("🔒 Admin access only.")
+        return
+    await update.message.reply_text(
+        "🛠 *Admin Panel*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")],
+            [InlineKeyboardButton("❌ Close", callback_data="admin_close")]
+        ])
+    )
+
+
 async def help_command(update, context):
     user = update.message.from_user
     await notify_admin(context, user, "❓ /help")
@@ -769,6 +799,67 @@ async def button_handler(update, context):
 
     elif data == "sell_menu":
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
+
+    elif data == "admin_ai_balance":
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        await query.message.reply_text(
+            "🤖 *AI Mode Balance*\n\nChoose an action:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add AI Balance", callback_data="admin_ai_add")],
+                [InlineKeyboardButton("➖ Remove AI Balance", callback_data="admin_ai_remove")],
+                [InlineKeyboardButton("💰 Check User Balance", callback_data="admin_ai_check")],
+                [InlineKeyboardButton("👥 AI Balance Users", callback_data="admin_ai_users")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_home")]
+            ])
+        )
+
+    elif data in ("admin_ai_add", "admin_ai_remove", "admin_ai_check"):
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        context.user_data["admin_ai_action"] = data
+        prompt = {
+            "admin_ai_add": "Enter the user's Telegram ID to add AI balance:",
+            "admin_ai_remove": "Enter the user's Telegram ID to remove AI balance:",
+            "admin_ai_check": "Enter the user's Telegram ID to check AI balance:"
+        }[data]
+        await query.message.reply_text(prompt)
+
+    elif data == "admin_ai_users":
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        db = load_ai_state()
+        rows = []
+        for uid, state in db.items():
+            try:
+                bal = float(state.get("ai_balance_sol", 0) or 0)
+            except (TypeError, ValueError):
+                bal = 0.0
+            if bal > 0:
+                rows.append(f"🆔 `{uid}` — {bal:.4f} SOL")
+        msg = "👥 *AI Balance Users*\n\n" + ("\n".join(rows) if rows else "No users currently have an AI balance.")
+        await query.message.reply_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_ai_balance")]])
+        )
+
+    elif data == "admin_home":
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        await query.message.reply_text(
+            "🛠 *Admin Panel*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")]])
+        )
+
+    elif data == "admin_close":
+        if user.id == ADMIN_ID:
+            await query.message.delete()
 
     elif data == "ai_mode":
         if not get_user_wallet(user.id):
@@ -978,6 +1069,48 @@ async def handle_message(update, context):
     user = update.message.from_user
     can_pnl = user.id in PNL_ALLOWED
 
+    # Admin AI balance management
+    admin_action = context.user_data.get("admin_ai_action")
+    if user.id == ADMIN_ID and admin_action:
+        if "admin_ai_user_id" not in context.user_data:
+            try:
+                target_uid = int(text)
+            except ValueError:
+                await update.message.reply_text("❌ Invalid Telegram ID. Enter the numeric Telegram ID:")
+                return
+            context.user_data["admin_ai_user_id"] = target_uid
+            if admin_action == "admin_ai_check":
+                bal = get_ai_balance(target_uid)
+                context.user_data.pop("admin_ai_action", None)
+                context.user_data.pop("admin_ai_user_id", None)
+                await update.message.reply_text(f"💰 User `{target_uid}` AI Balance: *{bal:.4f} SOL*", parse_mode="Markdown")
+                return
+            await update.message.reply_text("Enter the amount in SOL:")
+            return
+
+        try:
+            amount = float(text.replace(",", "").strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Enter a valid positive SOL amount:")
+            return
+
+        target_uid = context.user_data.pop("admin_ai_user_id")
+        action = context.user_data.pop("admin_ai_action")
+        current = get_ai_balance(target_uid)
+        if action == "admin_ai_add":
+            new_balance = set_ai_balance(target_uid, current + amount)
+            result = f"✅ Added *{amount:.4f} SOL*\nNew AI Balance: *{new_balance:.4f} SOL*"
+            action_name = "➕ Added AI balance"
+        else:
+            new_balance = set_ai_balance(target_uid, current - amount)
+            result = f"✅ Removed *{amount:.4f} SOL*\nNew AI Balance: *{new_balance:.4f} SOL*"
+            action_name = "➖ Removed AI balance"
+        await notify_admin(context, user, action_name, f"Target ID: {target_uid} | Amount: {amount:.4f} SOL")
+        await update.message.reply_text(f"👤 User `{target_uid}`\n\n{result}", parse_mode="Markdown")
+        return
+
     # Active License: require the user to enter the exact license key.
     if context.user_data.get("ai_license_pending"):
         if text != AI_LICENSE_KEY:
@@ -1178,6 +1311,7 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
