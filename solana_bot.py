@@ -451,11 +451,36 @@ def generate_pnl_card(token_name, token_symbol, buy_mcap, current_mcap,
 
 
 def scraperapi_get(url, **kwargs):
-    """GET a URL through ScraperAPI."""
+    """GET a URL, using ScraperAPI first and falling back to a direct request.
+
+    Some public token APIs reject or fail when routed through a proxy. The direct
+    fallback prevents valid Solana contract addresses from being reported as
+    "Token not found" merely because the proxy failed.
+    """
     params = kwargs.pop("params", {}) or {}
-    params["api_key"] = SCRAPER_API_KEY
-    params["url"] = url
-    return requests.get("https://api.scraperapi.com", params=params, **kwargs)
+    scraper_params = dict(params)
+    scraper_params["api_key"] = SCRAPER_API_KEY
+    scraper_params["url"] = url
+    try:
+        r = requests.get("https://api.scraperapi.com", params=scraper_params, **kwargs)
+        if r.ok and r.text.strip():
+            return r
+    except requests.RequestException:
+        pass
+
+    # Direct fallback for public APIs (DexScreener, GeckoTerminal, Jupiter, etc.)
+    return requests.get(url, params=params, **kwargs)
+
+
+def is_valid_solana_address(address):
+    """Basic Solana address validation: base58, 32-byte public-key length."""
+    if not isinstance(address, str):
+        return False
+    address = address.strip()
+    if not 32 <= len(address) <= 44:
+        return False
+    # Solana addresses use the Bitcoin-style base58 alphabet (no 0, O, I, l).
+    return bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]+", address))
 
 
 def get_token_metadata(address):
@@ -1390,7 +1415,7 @@ async def handle_message(update, context):
     pnl_state = waiting_for_pnl.get(user.id)
 
     if pnl_state and pnl_state.get("step") == "address":
-        if 32 <= len(text) <= 44 and text.isalnum():
+        if is_valid_solana_address(text):
             await update.message.reply_text("🔍 Fetching token info...")
             pair = get_token_info(text)
             if pair:
@@ -1495,7 +1520,7 @@ async def handle_message(update, context):
         waiting_for_wallet[user.id] = False
         return
 
-    if 32 <= len(text) <= 44 and text.isalnum():
+    if is_valid_solana_address(text):
         await update.message.reply_text("🔍 Scanning token...")
         pair = get_token_info(text)
         if pair:
