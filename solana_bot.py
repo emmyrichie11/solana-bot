@@ -938,6 +938,7 @@ async def button_handler(update, context):
             "🤖 *AI Target Trading*\n\n"
             "Trade with an AI-assisted target system built for focused, disciplined trading sessions.\n\n"
             "Set a target, trade toward it, and track your progress in real time — same tools, same speed, sharper focus.\n\n"
+            f"💰 *AI Balance:* {get_ai_balance(user.id):.4f} SOL\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📅 *1 Year Access — 2.5 SOL*\n"
             "━━━━━━━━━━━━━━━━━━━━",
@@ -1135,6 +1136,7 @@ async def button_handler(update, context):
             await query.message.reply_text("❌ Invalid trade request.")
             return
         action, address, symbol = parts
+        await query.answer()
         if ai_mode_active(user.id):
             pair = get_token_info(address)
             if not pair:
@@ -1187,6 +1189,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address, symbol, amount_text = parts
+        await query.answer()
         amount = parse_demo_amount(amount_text)
         if amount is None:
             await query.message.reply_text("❌ Invalid amount.")
@@ -1235,6 +1238,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address, symbol = parts
+        await query.answer()
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
         await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
 
@@ -1244,6 +1248,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address, symbol = parts
+        await query.answer()
         pair = get_token_info(address)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         positions = get_demo_positions(user.id)
