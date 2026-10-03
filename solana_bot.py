@@ -779,48 +779,35 @@ def main_menu_keyboard(user_id=None):
     return InlineKeyboardMarkup(buttons)
 
 def main_menu_text(user_id=None):
+    balance_label = "Wallet Balance"
+    balance = 0.0
     wallet = get_user_wallet(user_id) if user_id is not None else None
-    state = get_ai_state(user_id) if user_id is not None else {}
-    lines = [f"🦍 *Welcome to {BOT_NAME}!*", ""]
-
-    if user_id is not None:
-        username = state.get("username") or f"user_{user_id}"
-        lines.append(f"👤 *Username:* @{str(username).lstrip('@')}")
-        lines.append("")
-
-    if wallet and wallet.get("type") == "generated":
-        lines.append(f"🤖 *AI Mode Balance:* {get_ai_balance(user_id):.4f} SOL")
-        pub = wallet.get("public_key", "")
-        if pub:
-            lines.append(f"👛 *Wallet Address:* `{pub}`")
-    elif wallet and wallet.get("type") == "imported":
-        lines.append(f"💰 *Wallet Balance:* {get_solana_balance(wallet.get('public_key')):.4f} SOL")
-    else:
-        lines.append("💰 *Balance:* 0.0000 SOL")
-
-    if state.get("active") and state.get("target_usd"):
-        try:
-            lines.append(f"🎯 *Target:* ${float(state.get('target_usd', 0)):,.2f}")
-        except (TypeError, ValueError):
-            pass
-
-    lines.extend([
-        "━━━━━━━━━━━━━━━━━",
-        "",
-        "📋 *Paste a token contract address* to begin scanning.",
-        "",
+    if wallet:
+        if wallet.get("type") == "generated":
+            # Generated-wallet users see their AI Mode balance on Home.
+            balance_label = "AI Mode Balance"
+            balance = get_ai_balance(user_id)
+        else:
+            # Imported-wallet users see the actual on-chain wallet balance.
+            balance_label = "Wallet Balance"
+            balance = get_solana_balance(wallet.get("public_key"))
+    return (
+        f"🦍 *Welcome to {BOT_NAME}!*\n\n"
+        "Track hot tokens, catch early movers, and trade with speed.\n\n"
+        "Built for apes, powered by real-time data, and designed to help "
+        "you find the next rocket before it takes off 🚀\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"💰 *{balance_label}:* {balance:.4f} SOL\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "📋 *Paste a token contract address* to begin scanning.\n\n"
         "Use the buttons below to navigate."
-    ])
-    return "\n".join(lines)
+    )
 
 # ─────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────
 async def start(update, context):
     user = update.message.from_user
-    ai_state = get_ai_state(user.id)
-    ai_state["username"] = user.username or user.first_name or f"user_{user.id}"
-    save_ai_state_for_user(user.id, ai_state)
     waiting_for_wallet[user.id] = False
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
@@ -864,9 +851,6 @@ async def button_handler(update, context):
     await query.answer()
     data = query.data
     user = query.from_user
-    ai_state = get_ai_state(user.id)
-    ai_state["username"] = user.username or user.first_name or f"user_{user.id}"
-    save_ai_state_for_user(user.id, ai_state)
     can_pnl = user.id in PNL_ALLOWED
 
     await notify_admin(context, user, f"🔘 `{data}`")
@@ -1097,14 +1081,6 @@ async def button_handler(update, context):
         pub, priv = generate_solana_wallet()
         save_user_wallet(user.id, pub, priv, "generated")
         context.user_data["wallet_connected"] = True
-        ai_state = get_ai_state(user.id)
-        preserved_balance = get_ai_balance(user.id)
-        ai_state["active"] = False
-        ai_state["target_usd"] = 0
-        ai_state["demo_positions"] = []
-        ai_state["ai_balance_sol"] = preserved_balance
-        ai_state["username"] = user.username or user.first_name or f"user_{user.id}"
-        save_ai_state_for_user(user.id, ai_state)
         await query.message.reply_text(
             f"✅ *Wallet Generated!*\n\n"
             f"📬 Address:\n`{pub}`\n\n"
