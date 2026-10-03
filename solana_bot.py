@@ -138,6 +138,24 @@ def get_user_wallet(user_id):
     db = load_wallets()
     return db.get(str(user_id))
 
+def get_solana_balance(public_key):
+    """Return the current mainnet SOL balance for a public key.
+    Used only for imported-wallet display on the home screen.
+    """
+    if not public_key:
+        return 0.0
+    try:
+        r = requests.post(
+            "https://api.mainnet-beta.solana.com",
+            json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[public_key]},
+            timeout=8,
+        )
+        r.raise_for_status()
+        value = r.json().get("result", {}).get("value", 0)
+        return float(value) / 1_000_000_000
+    except Exception:
+        return 0.0
+
 def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
     db = load_wallets()
     db[str(user_id)] = {
@@ -756,17 +774,29 @@ def main_menu_keyboard(user_id=None):
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
 
-def main_menu_text():
+def main_menu_text(user_id=None):
+    balance_label = "Wallet Balance"
+    balance = 0.0
+    wallet = get_user_wallet(user_id) if user_id is not None else None
+    if wallet:
+        if wallet.get("type") == "generated":
+            # Generated-wallet users see their AI Mode balance on Home.
+            balance_label = "AI Mode Balance"
+            balance = get_ai_balance(user_id)
+        else:
+            # Imported-wallet users see the actual on-chain wallet balance.
+            balance_label = "Wallet Balance"
+            balance = get_solana_balance(wallet.get("public_key"))
     return (
         f"🦍 *Welcome to {BOT_NAME}\\!*\n\n"
-        "Track hot tokens, catch early movers, and trade with speed\\.\n\n"
-        "Built for apes, powered by real\\-time data, and designed to help "
+        "Track hot tokens, catch early movers, and trade with speed\.\n\n"
+        "Built for apes, powered by real\-time data, and designed to help "
         "you find the next rocket before it takes off 🚀\n\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "💰 *Wallet Balance:* 0\\.00 SOL\n"
+        f"💰 *{balance_label}:* {balance:.4f} SOL\n"
         "━━━━━━━━━━━━━━━━━\n\n"
-        "📋 *Paste a token contract address* to begin scanning\\.\n\n"
-        "Use the buttons below to navigate\\."
+        "📋 *Paste a token contract address* to begin scanning\.\n\n"
+        "Use the buttons below to navigate\."
     )
 
 # ─────────────────────────────────────────────
@@ -778,7 +808,7 @@ async def start(update, context):
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
     await notify_admin(context, user, "▶️ Started the bot")
-    await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
+    await update.message.reply_text(main_menu_text(user.id), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
 async def admin_command(update, context):
     user = update.effective_user
@@ -826,7 +856,7 @@ async def button_handler(update, context):
         waiting_for_pnl[user.id] = None
         waiting_for_ai_target[user.id] = False
         waiting_for_demo_trade.pop(user.id, None)
-        await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
+        await query.message.reply_text(main_menu_text(user.id), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
         if user.id not in PNL_ALLOWED:
@@ -1136,16 +1166,9 @@ async def button_handler(update, context):
             await query.message.reply_text("❌ Invalid trade request.")
             return
         action, address, symbol = parts
+        # Acknowledge the button immediately so Telegram never leaves it spinning.
         await query.answer()
         if ai_mode_active(user.id):
-            pair = get_token_info(address)
-            if not pair:
-                await query.message.reply_text("❌ Could not fetch current token price.")
-                return
-            price = float(pair.get("priceUsd", 0) or 0)
-            if price <= 0:
-                await query.message.reply_text("❌ Current token price is unavailable.")
-                return
             if action == "buy":
                 await query.message.reply_text(
                     f"🤖 *Buy — {symbol}*\n\n"
@@ -1162,6 +1185,11 @@ async def button_handler(update, context):
                     ])
                 )
             else:
+                pair = get_token_info(address)
+                price = float(pair.get("priceUsd", 0) or 0) if pair else 0
+                if price <= 0:
+                    await query.message.reply_text("❌ Current token price is unavailable.")
+                    return
                 positions = get_demo_positions(user.id)
                 pos = find_demo_position(positions, address)
                 if not pos:
