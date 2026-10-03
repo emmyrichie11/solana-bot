@@ -752,6 +752,8 @@ def main_menu_keyboard(user_id=None):
     ]
     if user_id is not None and get_user_wallet(user_id):
         buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
+    if user_id == ADMIN_ID:
+        buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
 
 def main_menu_text():
@@ -872,7 +874,7 @@ async def button_handler(update, context):
             await query.answer("Admin access only.", show_alert=True)
             return
         await query.message.reply_text(
-            "🤖 *AI Mode Balance*\n\nChoose an action:",
+            "🤖 *AI Mode Balance*\n➕ Add AI Balance\n➖ Remove AI Balance\n💰 Check User Balance\n👥 AI Balance Users\n🔒 Admin-only access\n💾 Balance saved in the existing AI state file\n\nChoose an action:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ Add AI Balance", callback_data="admin_ai_add")],
