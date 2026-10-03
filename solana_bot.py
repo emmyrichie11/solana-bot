@@ -201,7 +201,7 @@ def demo_balance_text(user_id):
     balance = get_ai_balance(user_id)
     target = state.get("target_usd", 0)
     positions = get_demo_positions(user_id)
-    return (f"💰 *Demo Balance:* {balance:.4f} SOL\n"
+    return (f"💰 *Balance:* {balance:.4f} SOL\n"
             f"🎯 *Target:* ${float(target):,.2f}\n"
             f"📦 *Open Positions:* {len(positions)}")
 
@@ -956,14 +956,13 @@ async def button_handler(update, context):
         balance = get_ai_balance(user.id)
         await query.message.reply_text(
             "🤖 *AI Mode enabled.*\n\n"
-            "Your target is saved and *Demo Trading* is now active.\n\n"
-            f"💰 *Demo Balance:* {balance:.4f} SOL\n"
+            "Your target is saved and you're ready to begin.\n\n"
+            f"💰 *Balance:* {balance:.4f} SOL\n"
             f"🎯 *Target:* ${float(state.get('target_usd', 0)):,.2f}\n\n"
-            "Use Buy/Sell on a scanned token to trade with demo SOL only.\n"
-            "⚠️ No real wallet SOL is used by AI Demo Trading.",
+            "Use Buy/Sell on a scanned token to trade.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🤖 Demo Balance", callback_data="ai_demo_balance"),
+                [InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance"),
                  InlineKeyboardButton("🏠 Start", callback_data="home")]
             ])
         )
@@ -973,7 +972,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active yet.", show_alert=True)
             return
         await query.message.reply_text(
-            "🤖 *AI Demo Trading*\n\n" + demo_balance_text(user.id),
+            "🤖 *AI Trading*\n\n" + demo_balance_text(user.id),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Refresh", callback_data="ai_demo_balance"),
@@ -1116,13 +1115,13 @@ async def button_handler(update, context):
                 return
             price = float(pair.get("priceUsd", 0) or 0)
             if price <= 0:
-                await query.message.reply_text("❌ Current token price is unavailable for demo trading.")
+                await query.message.reply_text("❌ Current token price is unavailable.")
                 return
             if action == "buy":
                 await query.message.reply_text(
-                    f"🤖 *Demo Buy — {symbol}*\n\n"
+                    f"🤖 *Buy — {symbol}*\n\n"
                     f"{demo_balance_text(user.id)}\n\n"
-                    "Choose how much demo SOL to use:",
+                    "Choose how much SOL to use:",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("0.1 SOL", callback_data=f"demo_buy:{address}:{symbol}:0.1"),
@@ -1137,10 +1136,10 @@ async def button_handler(update, context):
                 positions = get_demo_positions(user.id)
                 pos = find_demo_position(positions, address)
                 if not pos:
-                    await query.message.reply_text("ℹ️ You have no open demo position for this token.")
+                    await query.message.reply_text("ℹ️ You have no open position for this token.")
                     return
                 await query.message.reply_text(
-                    f"🔴 *Demo Sell — {symbol}*\n\n"
+                    f"🔴 *Sell — {symbol}*\n\n"
                     f"Current price: ${price:.10f}\n"
                     f"Position: {float(pos.get('amount_sol', 0)):.4f} SOL invested\n\n"
                     "Sell the full demo position?",
@@ -1158,16 +1157,16 @@ async def button_handler(update, context):
     elif data.startswith("demo_buy:"):
         parts = data.split(":", 3)
         if len(parts) != 4 or not ai_mode_active(user.id):
-            await query.answer("AI Demo Trading is not active.", show_alert=True)
+            await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address, symbol, amount_text = parts
         amount = parse_demo_amount(amount_text)
         if amount is None:
-            await query.message.reply_text("❌ Invalid demo amount.")
+            await query.message.reply_text("❌ Invalid amount.")
             return
         balance = get_ai_balance(user.id)
         if amount > balance:
-            await query.message.reply_text(f"❌ Insufficient demo balance. Available: {balance:.4f} SOL")
+            await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
         pair = get_token_info(address)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
@@ -1195,27 +1194,27 @@ async def button_handler(update, context):
             })
         set_ai_balance(user.id, balance - amount)
         save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI demo buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
+        await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
         await query.message.reply_text(
-            f"✅ *Demo Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
-            f"📈 Entry Price: ${price:.10f}\n💰 Remaining Demo Balance: {get_ai_balance(user.id):.4f} SOL",
+            f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
+            f"📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("🤖 Demo Balance", callback_data="ai_demo_balance")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
         )
 
     elif data.startswith("demo_buy_custom:"):
         parts = data.split(":", 2)
         if len(parts) != 3 or not ai_mode_active(user.id):
-            await query.answer("AI Demo Trading is not active.", show_alert=True)
+            await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address, symbol = parts
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
-        await query.message.reply_text("✏️ Enter the amount of demo SOL to buy with (e.g. 0.25):")
+        await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
 
     elif data.startswith("demo_sell:"):
         parts = data.split(":", 2)
         if len(parts) != 3 or not ai_mode_active(user.id):
-            await query.answer("AI Demo Trading is not active.", show_alert=True)
+            await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address, symbol = parts
         pair = get_token_info(address)
@@ -1223,7 +1222,7 @@ async def button_handler(update, context):
         positions = get_demo_positions(user.id)
         pos = find_demo_position(positions, address)
         if not pos or price <= 0:
-            await query.message.reply_text("❌ Demo position or current price unavailable.")
+            await query.message.reply_text("❌ Position or current price unavailable.")
             return
         tokens = float(pos.get("tokens", 0))
         invested = float(pos.get("amount_sol", 0))
@@ -1233,13 +1232,13 @@ async def button_handler(update, context):
         set_ai_balance(user.id, get_ai_balance(user.id) + value)
         positions = [p for p in positions if p.get("address") != address]
         save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI demo sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL")
+        await notify_admin(context, user, "🤖 AI sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL")
         await query.message.reply_text(
-            f"✅ *Demo Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
+            f"✅ *Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
             f"📊 PnL: {pnl:+.4f} SOL\n📈 Entry: ${entry:.10f}\n💵 Exit: ${price:.10f}\n"
-            f"💰 Demo Balance: {get_ai_balance(user.id):.4f} SOL",
+            f"💰 Balance: {get_ai_balance(user.id):.4f} SOL",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("🤖 Demo Balance", callback_data="ai_demo_balance")]])
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
         )
 
     elif data.startswith("refresh:"):
@@ -1368,7 +1367,7 @@ async def handle_message(update, context):
             await update.message.reply_text("❌ Current token price is unavailable.")
             return
         if amount > balance:
-            await update.message.reply_text(f"❌ Insufficient demo balance. Available: {balance:.4f} SOL")
+            await update.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
         tokens = amount / price
         positions = get_demo_positions(user.id)
@@ -1384,8 +1383,8 @@ async def handle_message(update, context):
             positions.append({"address": address, "symbol": symbol, "name": pair.get("baseToken", {}).get("name", symbol), "logo_url": (pair.get("info") or {}).get("imageUrl"), "tokens": tokens, "amount_sol": amount, "entry_price": price})
         set_ai_balance(user.id, balance - amount)
         save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI demo buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
-        await update.message.reply_text(f"✅ *Demo Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n📈 Entry Price: ${price:.10f}\n💰 Remaining Demo Balance: {get_ai_balance(user.id):.4f} SOL", parse_mode="Markdown")
+        await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
+        await update.message.reply_text(f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL", parse_mode="Markdown")
         return
 
     pnl_state = waiting_for_pnl.get(user.id)
