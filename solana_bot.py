@@ -41,6 +41,7 @@ waiting_for_pnl = {}
 waiting_for_import = {}  # tracks users in import wallet flow
 waiting_for_ai_target = {}  # tracks users entering an AI target
 waiting_for_demo_trade = {}  # tracks AI demo buy/sell flows
+USERNAME_CACHE = {}  # Telegram user_id -> username for the Home screen
 AI_LICENSE_KEY = "kenvor126"
 AI_ACCESS_PRICE_SOL = 2.5
 AI_DB_FILE = "ai_mode.json"
@@ -779,35 +780,49 @@ def main_menu_keyboard(user_id=None):
     return InlineKeyboardMarkup(buttons)
 
 def main_menu_text(user_id=None):
-    balance_label = "Wallet Balance"
-    balance = 0.0
     wallet = get_user_wallet(user_id) if user_id is not None else None
-    if wallet:
-        if wallet.get("type") == "generated":
-            # Generated-wallet users see their AI Mode balance on Home.
-            balance_label = "AI Mode Balance"
-            balance = get_ai_balance(user_id)
-        else:
-            # Imported-wallet users see the actual on-chain wallet balance.
-            balance_label = "Wallet Balance"
-            balance = get_solana_balance(wallet.get("public_key"))
-    return (
-        f"🦍 *Welcome to {BOT_NAME}!*\n\n"
-        "Track hot tokens, catch early movers, and trade with speed.\n\n"
-        "Built for apes, powered by real-time data, and designed to help "
-        "you find the next rocket before it takes off 🚀\n\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"💰 *{balance_label}:* {balance:.4f} SOL\n"
-        "━━━━━━━━━━━━━━━━━\n\n"
-        "📋 *Paste a token contract address* to begin scanning.\n\n"
+    state = get_ai_state(user_id) if user_id is not None else {}
+    active_ai = bool(state.get("active"))
+
+    lines = [f"🦍 *Welcome to {BOT_NAME}!*"]
+
+    if user_id is not None:
+        username = USERNAME_CACHE.get(user_id) or f"user_{user_id}"
+        lines.append(f"👤 *Username:* @{username.lstrip('@')}")
+
+    lines.extend(["", "Track hot tokens, catch early movers, and trade with speed.", "", "━━━━━━━━━━━━━━━━━"])
+
+    if wallet and wallet.get("type") == "generated":
+        # Generated-wallet users see the AI Mode balance on Home.
+        lines.append(f"🤖 *AI Mode Balance:* {get_ai_balance(user_id):.4f} SOL")
+        # Generated wallet address is shown once the wallet exists.
+        lines.append(f"👛 *Wallet Address:* `{wallet.get('public_key', '')}`")
+    elif wallet and wallet.get("type") == "imported":
+        # Imported-wallet users see the actual on-chain wallet balance.
+        lines.append(f"💰 *Wallet Balance:* {get_solana_balance(wallet.get('public_key')):.4f} SOL")
+    else:
+        lines.append("💰 *Balance:* 0.0000 SOL")
+
+    # Once AI Mode has been successfully activated, keep the target on the
+    # Home screen across /start and Home refreshes until a new wallet is generated.
+    if active_ai and state.get("target_usd"):
+        lines.append(f"🎯 *Target:* ${float(state.get('target_usd', 0)):,.2f}")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━",
+        "",
+        "📋 *Paste a token contract address* to begin scanning.",
+        "",
         "Use the buttons below to navigate."
-    )
+    ])
+    return "\n".join(lines)
 
 # ─────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────
 async def start(update, context):
     user = update.message.from_user
+    USERNAME_CACHE[user.id] = user.username or f"user_{user.id}"
     waiting_for_wallet[user.id] = False
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
@@ -851,6 +866,7 @@ async def button_handler(update, context):
     await query.answer()
     data = query.data
     user = query.from_user
+    USERNAME_CACHE[user.id] = user.username or f"user_{user.id}"
     can_pnl = user.id in PNL_ALLOWED
 
     await notify_admin(context, user, f"🔘 `{data}`")
@@ -1081,6 +1097,17 @@ async def button_handler(update, context):
         pub, priv = generate_solana_wallet()
         save_user_wallet(user.id, pub, priv, "generated")
         context.user_data["wallet_connected"] = True
+
+        # A newly generated wallet starts a fresh AI Mode session. Keep the
+        # admin-assigned AI balance, but clear the previous target, activation,
+        # and open positions so the old AI session does not carry over.
+        ai_state = get_ai_state(user.id)
+        preserved_balance = get_ai_balance(user.id)
+        ai_state["active"] = False
+        ai_state["target_usd"] = 0
+        ai_state["demo_positions"] = []
+        ai_state["ai_balance_sol"] = preserved_balance
+        save_ai_state_for_user(user.id, ai_state)
         await query.message.reply_text(
             f"✅ *Wallet Generated!*\n\n"
             f"📬 Address:\n`{pub}`\n\n"
