@@ -788,15 +788,15 @@ def main_menu_text(user_id=None):
             balance_label = "Wallet Balance"
             balance = get_solana_balance(wallet.get("public_key"))
     return (
-        f"🦍 *Welcome to {BOT_NAME}\\!*\n\n"
-        "Track hot tokens, catch early movers, and trade with speed\.\n\n"
-        "Built for apes, powered by real\-time data, and designed to help "
+        f"🦍 *Welcome to {BOT_NAME}!*\n\n"
+        "Track hot tokens, catch early movers, and trade with speed.\n\n"
+        "Built for apes, powered by real-time data, and designed to help "
         "you find the next rocket before it takes off 🚀\n\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"💰 *{balance_label}:* {balance:.4f} SOL\n"
         "━━━━━━━━━━━━━━━━━\n\n"
-        "📋 *Paste a token contract address* to begin scanning\.\n\n"
-        "Use the buttons below to navigate\."
+        "📋 *Paste a token contract address* to begin scanning.\n\n"
+        "Use the buttons below to navigate."
     )
 
 # ─────────────────────────────────────────────
@@ -808,7 +808,7 @@ async def start(update, context):
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
     await notify_admin(context, user, "▶️ Started the bot")
-    await update.message.reply_text(main_menu_text(user.id), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
+    await update.message.reply_text(main_menu_text(user.id), parse_mode="Markdown", reply_markup=main_menu_keyboard(user.id))
 
 async def admin_command(update, context):
     user = update.effective_user
@@ -856,7 +856,7 @@ async def button_handler(update, context):
         waiting_for_pnl[user.id] = None
         waiting_for_ai_target[user.id] = False
         waiting_for_demo_trade.pop(user.id, None)
-        await query.message.reply_text(main_menu_text(user.id), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
+        await query.message.reply_text(main_menu_text(user.id), parse_mode="Markdown", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
         if user.id not in PNL_ALLOWED:
