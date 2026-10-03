@@ -40,7 +40,6 @@ waiting_for_wallet = {}
 waiting_for_pnl = {}
 waiting_for_import = {}  # tracks users in import wallet flow
 waiting_for_ai_target = {}  # tracks users entering an AI target
-waiting_for_demo_trade = {}  # tracks AI demo buy/sell flows
 AI_LICENSE_KEY = "kenvor126"
 AI_ACCESS_PRICE_SOL = 2.5
 AI_DB_FILE = "ai_mode.json"
@@ -166,60 +165,6 @@ def save_ai_state_for_user(user_id, state):
     db = load_ai_state()
     db[str(user_id)] = state
     save_ai_state(db)
-
-
-def get_ai_balance(user_id):
-    state = get_ai_state(user_id)
-    try:
-        return float(state.get("ai_balance_sol", 0) or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def set_ai_balance(user_id, balance_sol):
-    state = get_ai_state(user_id)
-    state["ai_balance_sol"] = max(0.0, float(balance_sol))
-    save_ai_state_for_user(user_id, state)
-    return state["ai_balance_sol"]
-
-
-def get_demo_positions(user_id):
-    state = get_ai_state(user_id)
-    positions = state.get("demo_positions", [])
-    return positions if isinstance(positions, list) else []
-
-def save_demo_positions(user_id, positions):
-    state = get_ai_state(user_id)
-    state["demo_positions"] = positions
-    save_ai_state_for_user(user_id, state)
-
-def ai_mode_active(user_id):
-    return bool(get_ai_state(user_id).get("active"))
-
-def demo_balance_text(user_id):
-    state = get_ai_state(user_id)
-    balance = get_ai_balance(user_id)
-    target = state.get("target_usd", 0)
-    positions = get_demo_positions(user_id)
-    return (f"💰 *Balance:* {balance:.4f} SOL\n"
-            f"🎯 *Target:* ${float(target):,.2f}\n"
-            f"📦 *Open Positions:* {len(positions)}")
-
-def parse_demo_amount(text):
-    cleaned = text.upper().replace("SOL", "").replace(",", "").strip()
-    if cleaned in ("X", "CUSTOM"):
-        return None
-    try:
-        amount = float(cleaned)
-        return amount if amount > 0 else None
-    except ValueError:
-        return None
-
-def find_demo_position(positions, address):
-    for pos in positions:
-        if pos.get("address") == address:
-            return pos
-    return None
 
 
 # ─────────────────────────────────────────────
@@ -698,8 +643,8 @@ def build_token_message(pair):
 
 def token_keyboard(symbol, address):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{address}:{symbol}"),
-         InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{address}:{symbol}")],
+        [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{symbol}"),
+         InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{symbol}")],
         [InlineKeyboardButton("📊 Generate PnL Card", callback_data=f"pnl:{address}")],
         [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
@@ -749,24 +694,8 @@ async def start(update, context):
     user = update.message.from_user
     waiting_for_wallet[user.id] = False
     waiting_for_pnl[user.id] = None
-    waiting_for_demo_trade.pop(user.id, None)
     await notify_admin(context, user, "▶️ Started the bot")
     await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
-
-async def admin_command(update, context):
-    user = update.effective_user
-    if user.id != ADMIN_ID:
-        await update.message.reply_text("🔒 Admin access only.")
-        return
-    await update.message.reply_text(
-        "🛠 *Admin Panel*",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")],
-            [InlineKeyboardButton("❌ Close", callback_data="admin_close")]
-        ])
-    )
-
 
 async def help_command(update, context):
     user = update.message.from_user
@@ -798,7 +727,6 @@ async def button_handler(update, context):
         waiting_for_wallet[user.id] = False
         waiting_for_pnl[user.id] = None
         waiting_for_ai_target[user.id] = False
-        waiting_for_demo_trade.pop(user.id, None)
         await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
@@ -841,67 +769,6 @@ async def button_handler(update, context):
 
     elif data == "sell_menu":
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
-
-    elif data == "admin_ai_balance":
-        if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
-            return
-        await query.message.reply_text(
-            "🤖 *AI Mode Balance*\n\nChoose an action:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ Add AI Balance", callback_data="admin_ai_add")],
-                [InlineKeyboardButton("➖ Remove AI Balance", callback_data="admin_ai_remove")],
-                [InlineKeyboardButton("💰 Check User Balance", callback_data="admin_ai_check")],
-                [InlineKeyboardButton("👥 AI Balance Users", callback_data="admin_ai_users")],
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_home")]
-            ])
-        )
-
-    elif data in ("admin_ai_add", "admin_ai_remove", "admin_ai_check"):
-        if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
-            return
-        context.user_data["admin_ai_action"] = data
-        prompt = {
-            "admin_ai_add": "Enter the user's Telegram ID to add AI balance:",
-            "admin_ai_remove": "Enter the user's Telegram ID to remove AI balance:",
-            "admin_ai_check": "Enter the user's Telegram ID to check AI balance:"
-        }[data]
-        await query.message.reply_text(prompt)
-
-    elif data == "admin_ai_users":
-        if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
-            return
-        db = load_ai_state()
-        rows = []
-        for uid, state in db.items():
-            try:
-                bal = float(state.get("ai_balance_sol", 0) or 0)
-            except (TypeError, ValueError):
-                bal = 0.0
-            if bal > 0:
-                rows.append(f"🆔 `{uid}` — {bal:.4f} SOL")
-        msg = "👥 *AI Balance Users*\n\n" + ("\n".join(rows) if rows else "No users currently have an AI balance.")
-        await query.message.reply_text(
-            msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_ai_balance")]])
-        )
-
-    elif data == "admin_home":
-        if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
-            return
-        await query.message.reply_text(
-            "🛠 *Admin Panel*",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")]])
-        )
-
-    elif data == "admin_close":
-        if user.id == ADMIN_ID:
-            await query.message.delete()
 
     elif data == "ai_mode":
         if not get_user_wallet(user.id):
@@ -951,32 +818,13 @@ async def button_handler(update, context):
             await query.answer("Set your target first.", show_alert=True)
             return
         state["active"] = True
-        state.setdefault("demo_positions", [])
         save_ai_state_for_user(user.id, state)
-        balance = get_ai_balance(user.id)
         await query.message.reply_text(
             "🤖 *AI Mode enabled.*\n\n"
-            "Your target is saved and you're ready to begin.\n\n"
-            f"💰 *Balance:* {balance:.4f} SOL\n"
-            f"🎯 *Target:* ${float(state.get('target_usd', 0)):,.2f}\n\n"
-            "Use Buy/Sell on a scanned token to trade.",
+            "Your target is saved. The AI Mode simulation is ready to use.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance"),
-                 InlineKeyboardButton("🏠 Start", callback_data="home")]
-            ])
-        )
-
-    elif data == "ai_demo_balance":
-        if not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active yet.", show_alert=True)
-            return
-        await query.message.reply_text(
-            "🤖 *AI Trading*\n\n" + demo_balance_text(user.id),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="ai_demo_balance"),
-                 InlineKeyboardButton("🏠 Start", callback_data="home")]
+                [InlineKeyboardButton("🏠 Start", callback_data="home")]
             ])
         )
 
@@ -1102,144 +950,13 @@ async def button_handler(update, context):
             f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu",
             parse_mode="Markdown")
 
-    elif data.startswith("buy:") or data.startswith("sell:"):
-        parts = data.split(":", 2)
-        if len(parts) < 3:
-            await query.message.reply_text("❌ Invalid trade request.")
-            return
-        action, address, symbol = parts
-        if ai_mode_active(user.id):
-            pair = get_token_info(address)
-            if not pair:
-                await query.message.reply_text("❌ Could not fetch current token price.")
-                return
-            price = float(pair.get("priceUsd", 0) or 0)
-            if price <= 0:
-                await query.message.reply_text("❌ Current token price is unavailable.")
-                return
-            if action == "buy":
-                await query.message.reply_text(
-                    f"🤖 *Buy — {symbol}*\n\n"
-                    f"{demo_balance_text(user.id)}\n\n"
-                    "Choose how much SOL to use:",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("0.1 SOL", callback_data=f"demo_buy:{address}:{symbol}:0.1"),
-                         InlineKeyboardButton("0.5 SOL", callback_data=f"demo_buy:{address}:{symbol}:0.5")],
-                        [InlineKeyboardButton("1 SOL", callback_data=f"demo_buy:{address}:{symbol}:1"),
-                         InlineKeyboardButton("5 SOL", callback_data=f"demo_buy:{address}:{symbol}:5")],
-                        [InlineKeyboardButton("✏️ Custom", callback_data=f"demo_buy_custom:{address}:{symbol}"),
-                         InlineKeyboardButton("❌ Cancel", callback_data="home")]
-                    ])
-                )
-            else:
-                positions = get_demo_positions(user.id)
-                pos = find_demo_position(positions, address)
-                if not pos:
-                    await query.message.reply_text("ℹ️ You have no open position for this token.")
-                    return
-                await query.message.reply_text(
-                    f"🔴 *Sell — {symbol}*\n\n"
-                    f"Current price: ${price:.10f}\n"
-                    f"Position: {float(pos.get('amount_sol', 0)):.4f} SOL invested\n\n"
-                    "Sell the full demo position?",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔴 Sell All", callback_data=f"demo_sell:{address}:{symbol}")],
-                        [InlineKeyboardButton("❌ Cancel", callback_data="home")]
-                    ])
-                )
-        else:
-            await query.message.reply_text(
-                f"{'🟢' if action == 'buy' else '🔴'} *{symbol}*\n\n⚠️ Connect your wallet first.",
-                parse_mode="Markdown")
+    elif data.startswith("buy:"):
+        symbol = data.split(":")[1]
+        await query.message.reply_text(f"🟢 *Buy {symbol}*\n\n⚠️ Connect your wallet first.", parse_mode="Markdown")
 
-    elif data.startswith("demo_buy:"):
-        parts = data.split(":", 3)
-        if len(parts) != 4 or not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active.", show_alert=True)
-            return
-        _, address, symbol, amount_text = parts
-        amount = parse_demo_amount(amount_text)
-        if amount is None:
-            await query.message.reply_text("❌ Invalid amount.")
-            return
-        balance = get_ai_balance(user.id)
-        if amount > balance:
-            await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
-            return
-        pair = get_token_info(address)
-        price = float(pair.get("priceUsd", 0) or 0) if pair else 0
-        if price <= 0:
-            await query.message.reply_text("❌ Current token price is unavailable.")
-            return
-        positions = get_demo_positions(user.id)
-        pos = find_demo_position(positions, address)
-        tokens = amount / price
-        if pos:
-            old_amount = float(pos.get("amount_sol", 0))
-            old_tokens = float(pos.get("tokens", 0))
-            total_amount = old_amount + amount
-            pos["tokens"] = old_tokens + tokens
-            pos["amount_sol"] = total_amount
-            pos["entry_price"] = total_amount / pos["tokens"]
-            pos["symbol"] = symbol
-        else:
-            positions.append({
-                "address": address, "symbol": symbol,
-                "name": pair.get("baseToken", {}).get("name", symbol),
-                "logo_url": (pair.get("info") or {}).get("imageUrl"),
-                "tokens": tokens, "amount_sol": amount,
-                "entry_price": price
-            })
-        set_ai_balance(user.id, balance - amount)
-        save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
-        await query.message.reply_text(
-            f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
-            f"📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
-        )
-
-    elif data.startswith("demo_buy_custom:"):
-        parts = data.split(":", 2)
-        if len(parts) != 3 or not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active.", show_alert=True)
-            return
-        _, address, symbol = parts
-        waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
-        await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
-
-    elif data.startswith("demo_sell:"):
-        parts = data.split(":", 2)
-        if len(parts) != 3 or not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active.", show_alert=True)
-            return
-        _, address, symbol = parts
-        pair = get_token_info(address)
-        price = float(pair.get("priceUsd", 0) or 0) if pair else 0
-        positions = get_demo_positions(user.id)
-        pos = find_demo_position(positions, address)
-        if not pos or price <= 0:
-            await query.message.reply_text("❌ Position or current price unavailable.")
-            return
-        tokens = float(pos.get("tokens", 0))
-        invested = float(pos.get("amount_sol", 0))
-        entry = float(pos.get("entry_price", 0))
-        value = tokens * price
-        pnl = value - invested
-        set_ai_balance(user.id, get_ai_balance(user.id) + value)
-        positions = [p for p in positions if p.get("address") != address]
-        save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL")
-        await query.message.reply_text(
-            f"✅ *Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
-            f"📊 PnL: {pnl:+.4f} SOL\n📈 Entry: ${entry:.10f}\n💵 Exit: ${price:.10f}\n"
-            f"💰 Balance: {get_ai_balance(user.id):.4f} SOL",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
-        )
+    elif data.startswith("sell:"):
+        symbol = data.split(":")[1]
+        await query.message.reply_text(f"🔴 *Sell {symbol}*\n\n⚠️ Connect your wallet first.", parse_mode="Markdown")
 
     elif data.startswith("refresh:"):
         address = data.split(":")[1]
@@ -1260,48 +977,6 @@ async def handle_message(update, context):
     text = update.message.text.strip()
     user = update.message.from_user
     can_pnl = user.id in PNL_ALLOWED
-
-    # Admin AI balance management
-    admin_action = context.user_data.get("admin_ai_action")
-    if user.id == ADMIN_ID and admin_action:
-        if "admin_ai_user_id" not in context.user_data:
-            try:
-                target_uid = int(text)
-            except ValueError:
-                await update.message.reply_text("❌ Invalid Telegram ID. Enter the numeric Telegram ID:")
-                return
-            context.user_data["admin_ai_user_id"] = target_uid
-            if admin_action == "admin_ai_check":
-                bal = get_ai_balance(target_uid)
-                context.user_data.pop("admin_ai_action", None)
-                context.user_data.pop("admin_ai_user_id", None)
-                await update.message.reply_text(f"💰 User `{target_uid}` AI Balance: *{bal:.4f} SOL*", parse_mode="Markdown")
-                return
-            await update.message.reply_text("Enter the amount in SOL:")
-            return
-
-        try:
-            amount = float(text.replace(",", "").strip())
-            if amount <= 0:
-                raise ValueError
-        except ValueError:
-            await update.message.reply_text("❌ Enter a valid positive SOL amount:")
-            return
-
-        target_uid = context.user_data.pop("admin_ai_user_id")
-        action = context.user_data.pop("admin_ai_action")
-        current = get_ai_balance(target_uid)
-        if action == "admin_ai_add":
-            new_balance = set_ai_balance(target_uid, current + amount)
-            result = f"✅ Added *{amount:.4f} SOL*\nNew AI Balance: *{new_balance:.4f} SOL*"
-            action_name = "➕ Added AI balance"
-        else:
-            new_balance = set_ai_balance(target_uid, current - amount)
-            result = f"✅ Removed *{amount:.4f} SOL*\nNew AI Balance: *{new_balance:.4f} SOL*"
-            action_name = "➖ Removed AI balance"
-        await notify_admin(context, user, action_name, f"Target ID: {target_uid} | Amount: {amount:.4f} SOL")
-        await update.message.reply_text(f"👤 User `{target_uid}`\n\n{result}", parse_mode="Markdown")
-        return
 
     # Active License: require the user to enter the exact license key.
     if context.user_data.get("ai_license_pending"):
@@ -1333,13 +1008,11 @@ async def handle_message(update, context):
             return
 
         waiting_for_ai_target[user.id] = False
-        existing_state = get_ai_state(user.id)
-        existing_state["license_key"] = AI_LICENSE_KEY
-        existing_state["target_usd"] = target_usd
-        existing_state["active"] = False
-        existing_state.setdefault("demo_positions", [])
-        existing_state.setdefault("ai_balance_sol", 0.0)
-        save_ai_state_for_user(user.id, existing_state)
+        save_ai_state_for_user(user.id, {
+            "license_key": AI_LICENSE_KEY,
+            "target_usd": target_usd,
+            "active": False
+        })
         await update.message.reply_text(
             f"🎯 *Target set:* ${target_usd:,.2f}\n\n"
             "*Ready to begin?*",
@@ -1349,42 +1022,6 @@ async def handle_message(update, context):
                 [InlineKeyboardButton("🔙 Back", callback_data="ai_mode")]
             ])
         )
-        return
-
-    demo_pending = waiting_for_demo_trade.get(user.id)
-    if demo_pending and ai_mode_active(user.id):
-        amount = parse_demo_amount(text)
-        if amount is None:
-            await update.message.reply_text("⚠️ Enter a valid positive SOL amount, for example 0.25")
-            return
-        waiting_for_demo_trade.pop(user.id, None)
-        address = demo_pending["address"]
-        symbol = demo_pending["symbol"]
-        pair = get_token_info(address)
-        price = float(pair.get("priceUsd", 0) or 0) if pair else 0
-        balance = get_ai_balance(user.id)
-        if price <= 0:
-            await update.message.reply_text("❌ Current token price is unavailable.")
-            return
-        if amount > balance:
-            await update.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
-            return
-        tokens = amount / price
-        positions = get_demo_positions(user.id)
-        pos = find_demo_position(positions, address)
-        if pos:
-            old_amount = float(pos.get("amount_sol", 0))
-            old_tokens = float(pos.get("tokens", 0))
-            total_amount = old_amount + amount
-            pos["tokens"] = old_tokens + tokens
-            pos["amount_sol"] = total_amount
-            pos["entry_price"] = total_amount / pos["tokens"]
-        else:
-            positions.append({"address": address, "symbol": symbol, "name": pair.get("baseToken", {}).get("name", symbol), "logo_url": (pair.get("info") or {}).get("imageUrl"), "tokens": tokens, "amount_sol": amount, "entry_price": price})
-        set_ai_balance(user.id, balance - amount)
-        save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
-        await update.message.reply_text(f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL", parse_mode="Markdown")
         return
 
     pnl_state = waiting_for_pnl.get(user.id)
@@ -1541,7 +1178,6 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
