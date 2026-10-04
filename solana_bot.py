@@ -778,30 +778,30 @@ def main_menu_keyboard(user_id=None):
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
 
-def main_menu_text(user_id=None):
+def main_menu_text(user_id=None, username=None):
     balance_label = "Wallet Balance"
     balance = 0.0
+    wallet_address = None
+    target_text = None
     wallet = get_user_wallet(user_id) if user_id is not None else None
     if wallet:
+        wallet_address = wallet.get("public_key")
         if wallet.get("type") == "generated":
-            # Generated-wallet users see their AI Mode balance on Home.
             balance_label = "AI Mode Balance"
             balance = get_ai_balance(user_id)
         else:
-            # Imported-wallet users see the actual on-chain wallet balance.
-            balance_label = "Wallet Balance"
             balance = get_solana_balance(wallet.get("public_key"))
-    return (
-        f"🦍 *Welcome to {BOT_NAME}!*\n\n"
-        "Track hot tokens, catch early movers, and trade with speed.\n\n"
-        "Built for apes, powered by real-time data, and designed to help "
-        "you find the next rocket before it takes off 🚀\n\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"💰 *{balance_label}:* {balance:.4f} SOL\n"
-        "━━━━━━━━━━━━━━━━━\n\n"
-        "📋 *Paste a token contract address* to begin scanning.\n\n"
-        "Use the buttons below to navigate."
-    )
+        try:
+            ai_state = get_ai_state(user_id)
+            if ai_state.get("active") and ai_state.get("target_usd"):
+                target_text = f"🎯 *Target:* ${float(ai_state['target_usd']):,.2f}"
+        except Exception:
+            pass
+    lines = [f"👤 *Username:* {username or 'User'}", "", f"🦍 *Welcome to {BOT_NAME}!*", "", "Track hot tokens, catch early movers, and trade with speed.", "", "━━━━━━━━━━━━━━━━━", f"💰 *{balance_label}:* {balance:.4f} SOL"]
+    if wallet_address: lines.append(f"👛 *Wallet:* `{wallet_address}`")
+    if target_text: lines.append(target_text)
+    lines += ["━━━━━━━━━━━━━━━━━", "", "📋 *Paste a token contract address* to begin scanning.", "", "Use the buttons below to navigate."]
+    return "\n".join(lines)
 
 # ─────────────────────────────────────────────
 # Commands
@@ -812,7 +812,7 @@ async def start(update, context):
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
     await notify_admin(context, user, "▶️ Started the bot")
-    await update.message.reply_text(main_menu_text(user.id), parse_mode="Markdown", reply_markup=main_menu_keyboard(user.id))
+    await update.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), parse_mode="Markdown", reply_markup=main_menu_keyboard(user.id))
 
 async def admin_command(update, context):
     user = update.effective_user
