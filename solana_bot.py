@@ -759,6 +759,44 @@ def is_valid_seed_or_key(text):
     if re.match(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$', text.strip()): return True
     return False
 
+
+# ─────────────────────────────────────────────
+# Step 2: persistent AI Mode state
+AI_PERSIST_FILE = os.path.join(DATA_DIR, "ai_persistent_state.json")
+
+def load_ai_persistent_state():
+    try:
+        if os.path.exists(AI_PERSIST_FILE):
+            with open(AI_PERSIST_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def save_ai_persistent_state(data):
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = AI_PERSIST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, AI_PERSIST_FILE)
+    except Exception:
+        pass
+
+def get_persistent_ai_state(user_id):
+    return load_ai_persistent_state().get(str(user_id), {})
+
+def set_persistent_ai_state(user_id, state):
+    data = load_ai_persistent_state()
+    data[str(user_id)] = state
+    save_ai_persistent_state(data)
+
+def clear_persistent_ai_state(user_id):
+    data = load_ai_persistent_state()
+    data.pop(str(user_id), None)
+    save_ai_persistent_state(data)
+
 # ─────────────────────────────────────────────
 # Menu
 # ─────────────────────────────────────────────
@@ -837,7 +875,7 @@ def main_menu_text(user_id=None, username=None):
 # Commands
 # ─────────────────────────────────────────────
 async def start(update, context):
-    user = update.message.from_user
+    # Step 2: restore AI Mode state across /start and Home.\n    try:\n        _ai_saved = get_persistent_ai_state(user.id)\n        if _ai_saved.get('active'):\n            context.user_data['ai_active'] = True\n            context.user_data['ai_target'] = float(_ai_saved.get('target_usd', 0) or 0)\n    except Exception:\n        pass\n    user = update.message.from_user
     waiting_for_wallet[user.id] = False
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
@@ -1049,7 +1087,7 @@ async def button_handler(update, context):
         save_ai_state_for_user(user.id, state)
         balance = get_ai_balance(user.id)
         await query.message.reply_text(
-            "🤖 *AI Mode enabled.*\n\n"
+    # Step 2: persist successful AI Mode activation and target.\n    try:\n        set_persistent_ai_state(user_id, {\n            'active': True,\n            'target_usd': float(context.user_data.get('ai_target', 0) or 0),\n        })\n    except Exception:\n        pass\n            "🤖 *AI Mode enabled.*\n\n"
             "Your target is saved and you're ready to begin.\n\n"
             f"💰 *Balance:* {balance:.4f} SOL\n"
             f"🎯 *Target:* ${float(state.get('target_usd', 0)):,.2f}\n\n"
