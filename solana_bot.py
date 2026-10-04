@@ -805,7 +805,7 @@ def main_menu_text(user_id=None, username=None):
 
     safe_username = html.escape(username or "User")
     lines = [
-        "⚡ <b>Velo Terminal Vault</b>",
+        "⚡ <b>ApeRadarX Vault</b>",
         "━━━━━━━━━━━━━━━━━━━━",
         "",
         f"• <b>{safe_username}</b>",
