@@ -1108,6 +1108,15 @@ async def button_handler(update, context):
 
     elif data == "generate_wallet":
         await query.message.reply_text("⏳ Generating your wallet...")
+
+        # Step 2: generating a NEW wallet starts a fresh AI Mode session.
+        # Keep the existing AI balance, but clear the previous activation/target.
+        existing_ai = get_ai_state(user.id)
+        existing_ai["active"] = False
+        existing_ai["target_usd"] = 0
+        existing_ai.setdefault("demo_positions", [])
+        save_ai_state_for_user(user.id, existing_ai)
+
         pub, priv = generate_solana_wallet()
         save_user_wallet(user.id, pub, priv, "generated")
         context.user_data["wallet_connected"] = True
