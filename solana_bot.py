@@ -1,3 +1,4 @@
+import html
 # trigger redeploy v22
 """
 ApeRadarX Solana Telegram Bot
@@ -779,10 +780,12 @@ def main_menu_keyboard(user_id=None):
     return InlineKeyboardMarkup(buttons)
 
 def main_menu_text(user_id=None, username=None):
+    # Step 1 Home only: keep wallet generation/import and trading logic untouched.
     balance_label = "Wallet Balance"
     balance = 0.0
     wallet_address = None
     target_text = None
+
     wallet = get_user_wallet(user_id) if user_id is not None else None
     if wallet:
         wallet_address = wallet.get("public_key")
@@ -790,17 +793,44 @@ def main_menu_text(user_id=None, username=None):
             balance_label = "AI Mode Balance"
             balance = get_ai_balance(user_id)
         else:
+            balance_label = "Wallet Balance"
             balance = get_solana_balance(wallet.get("public_key"))
+
         try:
             ai_state = get_ai_state(user_id)
             if ai_state.get("active") and ai_state.get("target_usd"):
-                target_text = f"🎯 *Target:* ${float(ai_state['target_usd']):,.2f}"
+                target_text = f"🎯 <b>Target:</b> ${float(ai_state['target_usd']):,.2f}"
         except Exception:
             pass
-    lines = [f"👤 *Username:* {username or 'User'}", "", f"🦍 *Welcome to {BOT_NAME}!*", "", "Track hot tokens, catch early movers, and trade with speed.", "", "━━━━━━━━━━━━━━━━━", f"💰 *{balance_label}:* {balance:.4f} SOL"]
-    if wallet_address: lines.append(f"👛 *Wallet:* `{wallet_address}`")
-    if target_text: lines.append(target_text)
-    lines += ["━━━━━━━━━━━━━━━━━", "", "📋 *Paste a token contract address* to begin scanning.", "", "Use the buttons below to navigate."]
+
+    safe_username = html.escape(username or "User")
+    lines = [
+        "⚡ <b>Velo Terminal Vault</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"• <b>{safe_username}</b>",
+    ]
+
+    if wallet_address:
+        # This is the exact public key stored with the generated/imported wallet.
+        lines.append(f"• <code>{html.escape(str(wallet_address))}</code>")
+
+    lines += [
+        "",
+        f"• <b>{html.escape(balance_label)}</b>    {balance:.4f} SOL",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if wallet_address and balance <= 0:
+        lines += ["", "⚠️ Low balance — deposit SOL to trade."]
+
+    if target_text:
+        lines += ["", target_text]
+
+    lines += [
+        "",
+        "<i>Paste any Solana CA to trade instantly.</i>",
+    ]
     return "\n".join(lines)
 
 # ─────────────────────────────────────────────
@@ -812,7 +842,7 @@ async def start(update, context):
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
     await notify_admin(context, user, "▶️ Started the bot")
-    await update.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), reply_markup=main_menu_keyboard(user.id))
+    await update.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
 
 async def admin_command(update, context):
     user = update.effective_user
@@ -860,7 +890,7 @@ async def button_handler(update, context):
         waiting_for_pnl[user.id] = None
         waiting_for_ai_target[user.id] = False
         waiting_for_demo_trade.pop(user.id, None)
-        await query.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), reply_markup=main_menu_keyboard(user.id))
+        await query.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
         if user.id not in PNL_ALLOWED:
