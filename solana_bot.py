@@ -216,13 +216,65 @@ def ai_mode_active(user_id):
     return bool(get_ai_state(user_id).get("active"))
 
 def demo_balance_text(user_id):
+    """Show live mark-to-market value/PnL without changing the saved balance.
+    Open positions are repriced from the latest token price whenever this view
+    is opened/refreshed. The original entry data remains persistent.
+    """
     state = get_ai_state(user_id)
     balance = get_ai_balance(user_id)
     target = state.get("target_usd", 0)
     positions = get_demo_positions(user_id)
-    return (f"💰 *Balance:* {balance:.4f} SOL\n"
-            f"🎯 *Target:* ${float(target):,.2f}\n"
-            f"📦 *Open Positions:* {len(positions)}")
+
+    lines = [
+        f"💰 *Balance:* {balance:.4f} SOL",
+        f"🎯 *Target:* ${float(target):,.2f}",
+        f"📦 *Open Positions:* {len(positions)}",
+    ]
+
+    total_value = 0.0
+    total_invested = 0.0
+
+    for pos in positions:
+        address = pos.get("address", "")
+        symbol = pos.get("symbol", "TOKEN")
+        invested = float(pos.get("amount_sol", 0) or 0)
+        tokens = float(pos.get("tokens", 0) or 0)
+        entry = float(pos.get("entry_price", 0) or 0)
+
+        pair = get_token_info(address) if address else None
+        current_price = float(pair.get("priceUsd", 0) or 0) if pair else 0.0
+
+        if current_price > 0 and tokens > 0:
+            value = tokens * current_price
+            pnl = value - invested
+            pnl_pct = (pnl / invested * 100.0) if invested > 0 else 0.0
+            total_value += value
+            total_invested += invested
+            lines.append(
+                f"\n🪙 *{symbol}*\n"
+                f"Entry: ${entry:.10f}\n"
+                f"Current: ${current_price:.10f}\n"
+                f"Value: {value:.4f} SOL\n"
+                f"PnL: {pnl:+.4f} SOL ({pnl_pct:+.2f}%)"
+            )
+        else:
+            total_invested += invested
+            lines.append(
+                f"\n🪙 *{symbol}*\n"
+                f"Entry: ${entry:.10f}\n"
+                "Current: unavailable\n"
+                f"Invested: {invested:.4f} SOL"
+            )
+
+    if positions:
+        total_pnl = total_value - total_invested
+        total_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
+        lines.append(
+            f"\n📊 *Total Open Value:* {total_value:.4f} SOL\n"
+            f"📈 *Total Unrealized PnL:* {total_pnl:+.4f} SOL ({total_pct:+.2f}%)"
+        )
+
+    return "\n".join(lines)
 
 def parse_demo_amount(text):
     cleaned = text.upper().replace("SOL", "").replace(",", "").strip()
@@ -773,12 +825,8 @@ def main_menu_keyboard(user_id=None):
         [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
          InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
     ]
-    if user_id is not None:
-        wallet = get_user_wallet(user_id)
-        if wallet and wallet.get("type") == "generated":
-            ai_state = get_ai_state(user_id)
-            if not ai_state.get("active", False):
-                buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
+    if user_id is not None and get_user_wallet(user_id):
+        buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
@@ -1073,7 +1121,7 @@ async def button_handler(update, context):
             "🤖 *AI Trading*\n\n" + demo_balance_text(user.id),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data="ai_demo_balance"),
+                [InlineKeyboardButton("🔄 Refresh Prices", callback_data="ai_demo_balance"),
                  InlineKeyboardButton("🏠 Start", callback_data="home")]
             ])
         )
