@@ -88,15 +88,18 @@ def _supabase_upsert_user(user_id, payload):
         return False
     body = {"user_id": int(user_id), **payload}
     try:
+        # Explicitly upsert on user_id. This avoids creating duplicate rows or
+        # silently failing when user_id is the unique/primary key.
         r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/bot_users",
+            f"{SUPABASE_URL}/rest/v1/bot_users?on_conflict=user_id",
             headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
             json=body,
             timeout=8,
         )
         r.raise_for_status()
         return True
-    except Exception:
+    except Exception as exc:
+        print(f"⚠️ Supabase upsert failed for user {user_id}: {exc}")
         return False
 
 def load_wallets():
@@ -247,29 +250,29 @@ def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
 
 # ── AI Mode state ──
 def _row_to_ai_state(row):
-    """Rebuild one user's AI state without allowing legacy/default columns to
-    overwrite the canonical state_json when it already contains a value."""
+    """Return only state that is actually persisted in Supabase.
+
+    IMPORTANT: do not manufacture False/0 defaults here. A row created only
+    for wallet data may have empty AI columns; treating those empty columns as
+    authoritative would overwrite a valid local/cache state after a restart.
+    """
+    if not row:
+        return {}
+
+    raw = row.get("state_json")
+    if isinstance(raw, dict) and raw:
+        return dict(raw)
+
+    # Legacy schema fallback: only return fields that contain real values.
     state = {}
-    raw = row.get("state_json") if row else None
-    if isinstance(raw, dict):
-        state.update(raw)
-
-    if row:
-        # Legacy columns are fallbacks only. state_json is the canonical state.
-        if "active" not in state:
-            state["active"] = bool(row.get("ai_active", False))
-        if "ai_balance_sol" not in state:
-            state["ai_balance_sol"] = float(row.get("ai_balance", 0) or 0)
-        if "target_usd" not in state:
-            state["target_usd"] = float(row.get("target_balance", 0) or 0)
-        if "demo_positions" not in state:
-            positions = row.get("demo_positions", [])
-            state["demo_positions"] = positions if isinstance(positions, list) else []
-
-    state.setdefault("active", False)
-    state.setdefault("ai_balance_sol", 0.0)
-    state.setdefault("target_usd", 0.0)
-    state.setdefault("demo_positions", [])
+    if row.get("ai_active") is not None:
+        state["active"] = bool(row.get("ai_active"))
+    if row.get("ai_balance") is not None:
+        state["ai_balance_sol"] = float(row.get("ai_balance") or 0)
+    if row.get("target_balance") is not None:
+        state["target_usd"] = float(row.get("target_balance") or 0)
+    if isinstance(row.get("demo_positions"), list):
+        state["demo_positions"] = row.get("demo_positions")
     return state
 
 def load_ai_state():
@@ -305,10 +308,11 @@ def load_ai_state():
             current = local.get(uid, {})
             if not isinstance(current, dict):
                 current = {}
-            # Remote state is authoritative when it has actual saved values;
-            # retain any newer local fields that older schemas do not know about.
+            # Only merge fields that are genuinely persisted remotely. An empty
+            # legacy/default row must never reset a valid local state.
             merged = dict(current)
-            merged.update(remote)
+            if remote:
+                merged.update(remote)
             local[uid] = merged
         with open(AI_DB_FILE, "w") as f:
             json.dump(local, f)
@@ -1869,6 +1873,17 @@ def run_web_server():
 if __name__ == "__main__":
     ensure_pnl_template()
     print("🤖 ApeRadarX Bot starting...")
+    print(f"💾 Supabase persistence: {'enabled' if _supabase_enabled() else 'DISABLED'}")
+    if _supabase_enabled():
+        # Hydrate both persistent stores before accepting Telegram updates.
+        # This is intentionally best-effort: a temporary network failure must
+        # never wipe the local state.
+        try:
+            load_wallets()
+            load_ai_state()
+            print("✅ Persistent state hydration completed.")
+        except Exception as exc:
+            print(f"⚠️ Persistent state hydration failed: {exc}")
     if not SCRAPER_API_KEY or SCRAPER_API_KEY == "YOUR_SCRAPER_API_KEY_HERE":
         print("⚠️ SCRAPER_API_KEY is not configured. Add it to Render Environment Variables.")
     else:
