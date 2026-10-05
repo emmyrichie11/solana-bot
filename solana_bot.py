@@ -773,8 +773,12 @@ def main_menu_keyboard(user_id=None):
         [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
          InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
     ]
-    if user_id is not None and get_user_wallet(user_id):
-        buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
+    if user_id is not None:
+        wallet = get_user_wallet(user_id)
+        if wallet and wallet.get("type") == "generated":
+            ai_state = get_ai_state(user_id)
+            if not ai_state.get("active", False):
+                buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
