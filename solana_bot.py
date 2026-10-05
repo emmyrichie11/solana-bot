@@ -34,7 +34,7 @@ SCRAPER_API_KEY = os.environ.get(
 
 BOT_NAME = "ApeRadarX"
 ADMIN_ID = 1495066761
-PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698, 6916528207, 8821043422}
+PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698, 6916528207, 8821043422, 8604035305}
 
 # Background image URL (hosted on GitHub)
 
@@ -1375,7 +1375,7 @@ async def button_handler(update, context):
 
     elif data == "help":
         await query.message.reply_text(
-            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu",
+            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n📩 Contact Support: aperadarxcustomersupport@gmail.com\n/start — Main menu",
             parse_mode="Markdown")
 
     elif data.startswith("buy:") or data.startswith("sell:"):
