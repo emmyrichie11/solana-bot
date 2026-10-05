@@ -247,39 +247,73 @@ def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
 
 # ── AI Mode state ──
 def _row_to_ai_state(row):
+    """Rebuild one user's AI state without allowing legacy/default columns to
+    overwrite the canonical state_json when it already contains a value."""
     state = {}
     raw = row.get("state_json") if row else None
     if isinstance(raw, dict):
         state.update(raw)
+
     if row:
-        state["active"] = bool(row.get("ai_active", state.get("active", False)))
-        state["ai_balance_sol"] = float(row.get("ai_balance", state.get("ai_balance_sol", 0)) or 0)
-        state["target_usd"] = float(row.get("target_balance", state.get("target_usd", 0)) or 0)
-        positions = row.get("demo_positions", state.get("demo_positions", []))
-        state["demo_positions"] = positions if isinstance(positions, list) else []
+        # Legacy columns are fallbacks only. state_json is the canonical state.
+        if "active" not in state:
+            state["active"] = bool(row.get("ai_active", False))
+        if "ai_balance_sol" not in state:
+            state["ai_balance_sol"] = float(row.get("ai_balance", 0) or 0)
+        if "target_usd" not in state:
+            state["target_usd"] = float(row.get("target_balance", 0) or 0)
+        if "demo_positions" not in state:
+            positions = row.get("demo_positions", [])
+            state["demo_positions"] = positions if isinstance(positions, list) else []
+
+    state.setdefault("active", False)
+    state.setdefault("ai_balance_sol", 0.0)
+    state.setdefault("target_usd", 0.0)
+    state.setdefault("demo_positions", [])
     return state
 
 def load_ai_state():
+    """Load AI state from local cache and hydrate/merge Supabase state.
+
+    Supabase state_json is canonical when present; this prevents a Render restart
+    or a legacy false/default column from resetting an already-active AI session.
+    """
     try:
         with open(AI_DB_FILE, "r") as f:
             local = json.load(f)
+        if not isinstance(local, dict):
+            local = {}
     except Exception:
         local = {}
+
     if not _supabase_enabled():
         return local
+
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/bot_users",
             headers=_supabase_headers(),
-            params={"select": "user_id,ai_active,ai_balance,target_balance,demo_positions,state_json"},
+            params={"select":"user_id,ai_active,ai_balance,target_balance,demo_positions,state_json"},
             timeout=8,
         )
         r.raise_for_status()
         for row in r.json():
-            local[str(row["user_id"])] = _row_to_ai_state(row)
+            uid = str(row.get("user_id"))
+            if uid == "None":
+                continue
+            remote = _row_to_ai_state(row)
+            current = local.get(uid, {})
+            if not isinstance(current, dict):
+                current = {}
+            # Remote state is authoritative when it has actual saved values;
+            # retain any newer local fields that older schemas do not know about.
+            merged = dict(current)
+            merged.update(remote)
+            local[uid] = merged
         with open(AI_DB_FILE, "w") as f:
             json.dump(local, f)
     except Exception:
+        # Never turn a temporary Supabase/network failure into a state reset.
         pass
     return local
 
@@ -943,8 +977,13 @@ def main_menu_keyboard(user_id=None):
         [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
          InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
     ]
-    if user_id is not None and get_user_wallet(user_id):
-        buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
+    if user_id is not None:
+        wallet = get_user_wallet(user_id)
+        # AI Mode is available only after a NEW generated wallet exists and
+        # only until that wallet's AI session has been successfully activated.
+        if (wallet and wallet.get("type") == "generated" and
+                not ai_mode_active(user_id)):
+            buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
@@ -1039,7 +1078,7 @@ async def help_command(update, context):
         "📊 PnL Card — selected users only\n"
         "👛 Connect Wallet\n"
         "🎁 Claim Token\n"
-        "👥 Referrals\n\n/start — Main menu",
+        "👥 Referrals\n\n📩 Contact Support: aperadarxcustomersupport@gmail.com\n\n/start — Main menu",
         parse_mode="Markdown",
     )
 
@@ -1167,8 +1206,12 @@ async def button_handler(update, context):
             await query.message.delete()
 
     elif data == "ai_mode":
-        if not get_user_wallet(user.id):
-            await query.answer("Connect a wallet first.", show_alert=True)
+        wallet = get_user_wallet(user.id)
+        if not wallet or wallet.get("type") != "generated":
+            await query.answer("Generate a new wallet first.", show_alert=True)
+            return
+        if ai_mode_active(user.id):
+            await query.answer("AI Mode is already active.", show_alert=True)
             return
         await query.message.reply_text(
             "🤖 *AI Target Trading*\n\n"
@@ -1375,7 +1418,7 @@ async def button_handler(update, context):
 
     elif data == "help":
         await query.message.reply_text(
-            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n📩 Contact Support: aperadarxcustomersupport@gmail.com\n/start — Main menu",
+            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu\n\n📩 Contact Support: aperadarxcustomersupport@gmail.com",
             parse_mode="Markdown")
 
     elif data.startswith("buy:") or data.startswith("sell:"):
