@@ -1,4 +1,5 @@
 import html
+import asyncio
 # trigger redeploy v22
 """
 ApeRadarX Solana Telegram Bot
@@ -46,19 +47,97 @@ AI_LICENSE_KEY = "kenvor126"
 AI_ACCESS_PRICE_SOL = 2.5
 AI_DB_FILE = "ai_mode.json"
 
-# ── Wallet Database (JSON file) ──
+# ── Persistent storage ──
+# Render Free has an ephemeral filesystem.  When Supabase credentials are
+# configured, the bot mirrors wallet + AI state to the Supabase bot_users table.
+# Local JSON remains as a fallback/cache so the existing wallet-generation code
+# and its behavior are not changed.
 WALLET_DB_FILE = "wallets.json"
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+
+def _supabase_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+def _supabase_enabled():
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+
+def _supabase_get_user(user_id):
+    if not _supabase_enabled():
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bot_users",
+            headers=_supabase_headers(),
+            params={"user_id": f"eq.{int(user_id)}", "select": "*"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+def _supabase_upsert_user(user_id, payload):
+    if not _supabase_enabled():
+        return False
+    body = {"user_id": int(user_id), **payload}
+    try:
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/bot_users",
+            headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+            json=body,
+            timeout=8,
+        )
+        r.raise_for_status()
+        return True
+    except Exception:
+        return False
 
 def load_wallets():
     try:
         with open(WALLET_DB_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
+            local = json.load(f)
+    except Exception:
+        local = {}
+    if not _supabase_enabled():
+        return local
+    # Hydrate the local cache from Supabase so existing wallet helpers continue
+    # to work exactly as before.
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bot_users",
+            headers=_supabase_headers(),
+            params={"select": "user_id,wallet_address,wallet_private_key,wallet_generated"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        for row in r.json():
+            if row.get("wallet_address") and row.get("wallet_private_key"):
+                local[str(row["user_id"])] = {
+                    "public_key": row["wallet_address"],
+                    "private_key": row["wallet_private_key"],
+                    "type": "generated" if row.get("wallet_generated") else "imported",
+                }
+        return local
+    except Exception:
+        return local
 
 def save_wallets(db):
     with open(WALLET_DB_FILE, "w") as f:
         json.dump(db, f)
+    if _supabase_enabled():
+        for uid, wallet in db.items():
+            _supabase_upsert_user(uid, {
+                "wallet_address": wallet.get("public_key"),
+                "wallet_private_key": wallet.get("private_key"),
+                "wallet_generated": wallet.get("type", "imported") == "generated",
+            })
 
 def _base58_encode(data):
     """Encode bytes using Solana's Base58 alphabet without an external package."""
@@ -167,16 +246,55 @@ def save_user_wallet(user_id, public_key, private_key, wallet_type="generated"):
     save_wallets(db)
 
 # ── AI Mode state ──
+def _row_to_ai_state(row):
+    state = {}
+    raw = row.get("state_json") if row else None
+    if isinstance(raw, dict):
+        state.update(raw)
+    if row:
+        state["active"] = bool(row.get("ai_active", state.get("active", False)))
+        state["ai_balance_sol"] = float(row.get("ai_balance", state.get("ai_balance_sol", 0)) or 0)
+        state["target_usd"] = float(row.get("target_balance", state.get("target_usd", 0)) or 0)
+        positions = row.get("demo_positions", state.get("demo_positions", []))
+        state["demo_positions"] = positions if isinstance(positions, list) else []
+    return state
+
 def load_ai_state():
     try:
         with open(AI_DB_FILE, "r") as f:
-            return json.load(f)
+            local = json.load(f)
     except Exception:
-        return {}
+        local = {}
+    if not _supabase_enabled():
+        return local
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bot_users",
+            headers=_supabase_headers(),
+            params={"select": "user_id,ai_active,ai_balance,target_balance,demo_positions,state_json"},
+            timeout=8,
+        )
+        r.raise_for_status()
+        for row in r.json():
+            local[str(row["user_id"])] = _row_to_ai_state(row)
+        with open(AI_DB_FILE, "w") as f:
+            json.dump(local, f)
+    except Exception:
+        pass
+    return local
 
 def save_ai_state(db):
     with open(AI_DB_FILE, "w") as f:
         json.dump(db, f)
+    if _supabase_enabled():
+        for uid, state in db.items():
+            _supabase_upsert_user(uid, {
+                "ai_active": bool(state.get("active", False)),
+                "ai_balance": float(state.get("ai_balance_sol", 0) or 0),
+                "target_balance": float(state.get("target_usd", 0) or 0),
+                "demo_positions": state.get("demo_positions", []),
+                "state_json": state,
+            })
 
 def get_ai_state(user_id):
     return load_ai_state().get(str(user_id), {})
