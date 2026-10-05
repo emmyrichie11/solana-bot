@@ -54,6 +54,10 @@ AI_DB_FILE = "ai_mode.json"
 # and its behavior are not changed.
 WALLET_DB_FILE = "wallets.json"
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+# Accept either the Supabase project base URL or a value that already includes /rest/v1.
+# All REST calls below append /rest/v1 exactly once.
+if SUPABASE_URL.endswith("/rest/v1"):
+    SUPABASE_URL = SUPABASE_URL[:-len("/rest/v1")].rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 def _supabase_headers():
