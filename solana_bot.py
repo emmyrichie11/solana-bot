@@ -454,6 +454,101 @@ def find_demo_position(positions, address):
     return None
 
 
+def _position_entry_mcap(pos, current_mcap=0.0, current_price=0.0):
+    """Return the stored entry market cap, with a safe fallback for old positions."""
+    try:
+        stored = float(pos.get("entry_mcap", 0) or 0)
+        if stored > 0:
+            return stored
+    except (TypeError, ValueError):
+        pass
+    try:
+        entry_price = float(pos.get("entry_price", 0) or 0)
+        current_mcap = float(current_mcap or 0)
+        current_price = float(current_price or 0)
+        if entry_price > 0 and current_mcap > 0 and current_price > 0:
+            return current_mcap * entry_price / current_price
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return 0.0
+
+
+async def send_closed_pnl_card(context, user, query_message, pos, pair, exit_price, exit_value, pnl_sol):
+    """Send a closed-trade PnL card using the exact same artwork as the main PnL card.
+
+    This is used for AI/demo sells as well. The card itself is intentionally
+    neutral: it never says "demo", "paper", or "AI". It shows the trade data
+    exactly like the normal PnL card: entry MCap, exit/current MCap, invested
+    SOL, realized PnL and the resulting position value.
+    """
+    try:
+        base = (pair or {}).get("baseToken", {})
+        symbol = base.get("symbol", pos.get("symbol", "TOKEN"))
+        name = base.get("name", pos.get("name", symbol))
+        exit_price = float(exit_price or 0)
+        exit_value = float(exit_value or 0)
+        invested = float(pos.get("amount_sol", 0) or 0)
+        entry_price = float(pos.get("entry_price", 0) or 0)
+
+        # Prefer the stored entry market cap. For older positions, reconstruct it
+        # from entry price/current market cap when possible.
+        pair_mcap = float((pair or {}).get("marketCap", 0) or 0)
+        entry_mcap = _position_entry_mcap(pos, pair_mcap, exit_price)
+
+        # If the API does not return marketCap at sell time, derive the exit MCap
+        # from the entry MCap and price ratio. This keeps the card working for
+        # demo sells even when DexScreener omits marketCap temporarily.
+        if entry_mcap > 0 and entry_price > 0 and exit_price > 0:
+            exit_mcap = entry_mcap * (exit_price / entry_price)
+        else:
+            exit_mcap = pair_mcap
+
+        if exit_mcap <= 0 and pair_mcap > 0:
+            exit_mcap = pair_mcap
+
+        logo_url = (pair or {}).get("info", {}).get("imageUrl") or pos.get("logo_url")
+        username = user.username or user.first_name or "ApeRadarX"
+
+        if entry_mcap <= 0 or exit_mcap <= 0 or invested <= 0:
+            await query_message.reply_text(
+                "⚠️ Sell completed, but there wasn't enough market-cap data to generate the PnL card."
+            )
+            return
+
+        # The image is deliberately the SAME generate_pnl_card() used by the
+        # normal PnL-card flow. No demo/AI wording is passed into the image.
+        card = generate_pnl_card(
+            name, symbol, entry_mcap, exit_mcap,
+            username, invested, logo_url
+        )
+
+        # Use the actual closed position value for the realized result.
+        realized_pnl = exit_value - invested
+        realized_pct = (realized_pnl / invested * 100.0) if invested > 0 else 0.0
+        multiplier = exit_value / invested if invested > 0 else 0.0
+
+        await query_message.reply_photo(
+            photo=card,
+            caption=(
+                f"📊 *{symbol}* | *{multiplier:.2f}X* 🚀\n"
+                f"Realized PnL: *{realized_pnl:+.4f} SOL* ({realized_pct:+.2f}%)\n"
+                f"Invested: *{invested:.4f} SOL*\n"
+                f"Received: *{exit_value:.4f} SOL*\n"
+                f"Entry: *${entry_price:.10f}*\n"
+                f"Exit: *${exit_price:.10f}*\n"
+                "ApeRadarX"
+            ),
+            parse_mode="Markdown"
+        )
+        await notify_admin(
+            context, user,
+            f"📊 Closed PnL card: {symbol} {realized_pct:+.2f}%",
+            f"Invested {invested:.4f} SOL | Received {exit_value:.4f} SOL | PnL {realized_pnl:+.4f} SOL"
+        )
+    except Exception as exc:
+        await query_message.reply_text(f"⚠️ Sell completed, but PnL card generation failed: {exc}")
+
+
 # ─────────────────────────────────────────────
 # Admin notification
 # ─────────────────────────────────────────────
@@ -961,7 +1056,8 @@ def token_keyboard(symbol, address):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🟢 Buy {symbol}", callback_data=f"buy:{address}"),
          InlineKeyboardButton(f"🔴 Sell {symbol}", callback_data=f"sell:{address}")],
-        [InlineKeyboardButton("📊 Generate PnL Card", callback_data=f"pnl:{address}")],
+        [InlineKeyboardButton("📈 Chart / Price", callback_data=f"chart:{address}"),
+         InlineKeyboardButton("📊 Generate PnL Card", callback_data=f"pnl:{address}")],
         [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{address}")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
     ])
@@ -1430,6 +1526,73 @@ async def button_handler(update, context):
             f"❓ *Help*\n\n🔍 Paste Solana token address\n📊 PnL Card — selected users\n👛 Connect Wallet\n/start — Main menu\n\n📩 Contact Support: aperadarxcustomersupport@gmail.com",
             parse_mode="Markdown")
 
+    elif data.startswith("chart:"):
+        address = data.split(":", 1)[1]
+        pair = get_token_info(address)
+        if not pair:
+            await notify_admin(context, user, "❌ Chart/Price lookup failed", address)
+            await query.message.reply_text("❌ Could not fetch current token data.")
+            return
+        base = pair.get("baseToken", {})
+        name = base.get("name", "Unknown")
+        symbol = base.get("symbol", "TOKEN")
+        price = float(pair.get("priceUsd", 0) or 0)
+        mcap = float(pair.get("marketCap", 0) or 0)
+        liquidity = pair.get("liquidity", {}).get("usd", 0)
+        volume = pair.get("volume", {}).get("h24", 0)
+        h1 = pair.get("priceChange", {}).get("h1", "N/A")
+        h24 = pair.get("priceChange", {}).get("h24", "N/A")
+        dex = str(pair.get("dexId", "N/A")).upper()
+        url = pair.get("url", "")
+
+        lines = [
+            f"📈 *{name} (${symbol})*",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"💵 Price: `${price:.10f}`",
+            f"🏦 Market Cap: {format_number(mcap)}",
+            f"💧 Liquidity: {format_number(liquidity)}",
+            f"📦 24h Volume: {format_number(volume)}",
+            f"📈 1h: {h1}%",
+            f"📊 24h: {h24}%",
+            f"🔁 DEX: {dex}",
+        ]
+
+        if ai_mode_active(user.id):
+            pos = find_demo_position(get_demo_positions(user.id), address)
+            if pos:
+                invested = float(pos.get("amount_sol", 0) or 0)
+                tokens = float(pos.get("tokens", 0) or 0)
+                entry = float(pos.get("entry_price", 0) or 0)
+                value = tokens * price if price > 0 else 0.0
+                unrealized = value - invested
+                unrealized_pct = (unrealized / invested * 100.0) if invested > 0 else 0.0
+                lines += [
+                    "",
+                    "💼 *Your Position*",
+                    f"💰 Invested: {invested:.4f} SOL",
+                    f"🪙 Tokens: {tokens:,.4f}",
+                    f"📍 Entry Price: ${entry:.10f}",
+                    f"💼 Current Value: {value:.4f} SOL",
+                    f"📈 Unrealized PnL: {unrealized:+.4f} SOL ({unrealized_pct:+.2f}%)",
+                ]
+            else:
+                lines += ["", "💼 *Your Position*", "No open position for this token."]
+        else:
+            lines += ["", "💼 *Your Position*", "Connect a wallet / activate AI Mode to track your invested amount and unrealized PnL here."]
+
+        if url:
+            lines.append(f"\n[📎 Open chart]({url})")
+        await notify_admin(context, user, "📈 Chart / Price opened", f"{symbol} | {address}")
+        await query.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh", callback_data=f"chart:{address}"),
+                 InlineKeyboardButton("🏠 Main Menu", callback_data="home")]
+            ])
+        )
+
     elif data.startswith("buy:") or data.startswith("sell:"):
         action, address = data.split(":", 1)
         await query.message.reply_text("⏳ Opening trade... fetching the current token price.")
@@ -1517,6 +1680,12 @@ async def button_handler(update, context):
             pos["tokens"] = old_tokens + tokens
             pos["amount_sol"] = total_amount
             pos["entry_price"] = total_amount / pos["tokens"]
+            old_entry_mcap = _position_entry_mcap(pos, float(pair.get("marketCap", 0) or 0), price)
+            current_entry_mcap = float(pair.get("marketCap", 0) or 0)
+            if old_entry_mcap > 0 and current_entry_mcap > 0:
+                pos["entry_mcap"] = ((old_entry_mcap * old_amount) + (current_entry_mcap * amount)) / total_amount
+            elif current_entry_mcap > 0:
+                pos["entry_mcap"] = current_entry_mcap
             pos["symbol"] = symbol
         else:
             positions.append({
@@ -1524,7 +1693,8 @@ async def button_handler(update, context):
                 "name": pair.get("baseToken", {}).get("name", symbol),
                 "logo_url": (pair.get("info") or {}).get("imageUrl"),
                 "tokens": tokens, "amount_sol": amount,
-                "entry_price": price
+                "entry_price": price,
+                "entry_mcap": float(pair.get("marketCap", 0) or 0)
             })
         set_ai_balance(user.id, balance - amount)
         save_demo_positions(user.id, positions)
@@ -1582,6 +1752,8 @@ async def button_handler(update, context):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
         )
+        # Closed-trade PnL card: uses the same artwork/template as the main PnL card.
+        await send_closed_pnl_card(context, user, query.message, pos, pair, price, value, pnl)
 
     elif data.startswith("refresh:"):
         address = data.split(":")[1]
