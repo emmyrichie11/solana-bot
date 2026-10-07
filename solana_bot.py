@@ -1136,8 +1136,11 @@ def main_menu_keyboard(user_id=None):
         [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
          InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
     ]
-    # AI Mode is not shown in the normal user menu.
-    # Admin controls who is allowed to enter AI Mode from Admin Settings.
+    # AI Mode is shown only to users who have been granted access by the admin
+    # and have not successfully activated it yet. Once activated, the button
+    # disappears from the normal menu.
+    if user_id is not None and ai_mode_access_granted(user_id) and not ai_mode_active(user_id):
+        buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
