@@ -13,6 +13,7 @@ import re
 import io
 import random
 import threading
+import time
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -46,6 +47,44 @@ waiting_for_demo_trade = {}  # tracks AI demo buy/sell flows
 AI_LICENSE_KEY = "kenvor126"
 AI_ACCESS_PRICE_SOL = 2.5
 AI_DB_FILE = "ai_mode.json"
+
+# Cached SOL/USD price used only for displaying the AI Mode target in SOL.
+_SOL_PRICE_CACHE = {"price": 0.0, "ts": 0.0}
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+def get_sol_price_usd():
+    """Return a recent SOL/USD price for the AI target display.
+
+    This is display-only; it never changes AI balances or trading state.
+    """
+    now = time.time()
+    cached = float(_SOL_PRICE_CACHE.get("price", 0) or 0)
+    if cached > 0 and now - float(_SOL_PRICE_CACHE.get("ts", 0) or 0) < 60:
+        return cached
+    try:
+        r = scraperapi_get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{SOL_MINT}",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            pairs = r.json().get("pairs") or []
+            prices = []
+            for pair in pairs:
+                try:
+                    price = float(pair.get("priceUsd") or 0)
+                    if price > 0:
+                        prices.append((float(pair.get("liquidity", {}).get("usd", 0) or 0), price))
+                except (TypeError, ValueError):
+                    pass
+            if prices:
+                prices.sort(reverse=True)
+                price = prices[0][1]
+                _SOL_PRICE_CACHE.update({"price": price, "ts": now})
+                return price
+    except Exception:
+        pass
+    return cached
 
 # ── Persistent storage ──
 # Render Free has an ephemeral filesystem.  When Supabase credentials are
@@ -1109,6 +1148,7 @@ def main_menu_text(user_id=None, username=None):
     balance = 0.0
     wallet_address = None
     target_text = None
+    ai_home_format = False
 
     wallet = get_user_wallet(user_id) if user_id is not None else None
     if wallet:
@@ -1122,8 +1162,17 @@ def main_menu_text(user_id=None, username=None):
 
         try:
             ai_state = get_ai_state(user_id)
-            if ai_state.get("active") and ai_state.get("target_usd"):
-                target_text = f"🎯 <b>Target:</b> ${float(ai_state['target_usd']):,.2f}"
+            if (wallet.get("type") == "generated" and
+                    ai_state.get("active") and ai_state.get("target_usd")):
+                target_usd = float(ai_state.get("target_usd", 0) or 0)
+                sol_price = get_sol_price_usd()
+                target_sol = (target_usd / sol_price) if sol_price > 0 else 0.0
+                target_text = (
+                    f"• Target Balance ${target_usd:.0f} "
+                    f"(~{target_sol:.4f} SOL)" if target_sol > 0 else
+                    f"• Target Balance ${target_usd:.0f}"
+                )
+                ai_home_format = True
         except Exception:
             pass
 
@@ -1139,16 +1188,25 @@ def main_menu_text(user_id=None, username=None):
         # This is the exact public key stored with the generated/imported wallet.
         lines.append(f"• <code>{html.escape(str(wallet_address))}</code>")
 
-    lines += [
-        "",
-        f"• <b>{html.escape(balance_label)}</b>    {balance:.4f} SOL",
-        "━━━━━━━━━━━━━━━━━━━━",
-    ]
+    if ai_home_format and target_text:
+        # AI Mode only: match the requested Target Balance / Balance layout.
+        lines += [
+            "",
+            target_text,
+            f"• Balance {balance:.4f} SOL",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
+    else:
+        lines += [
+            "",
+            f"• <b>{html.escape(balance_label)}</b>    {balance:.4f} SOL",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
 
     if wallet_address and balance <= 0:
         lines += ["", "⚠️ Low balance — deposit SOL to trade."]
 
-    if target_text:
+    if target_text and not ai_home_format:
         lines += ["", target_text]
 
     lines += [
