@@ -448,13 +448,19 @@ def ai_mode_access_granted(user_id):
     return bool(get_ai_state(user_id).get("ai_access_granted", False))
 
 def set_ai_mode_access(user_id, granted):
-    """Grant/revoke future AI Mode access without changing an active session.
-
-    Revoking access deliberately does NOT modify active, target, balance, or
-    positions. An already-active AI session remains active.
-    """
+    """Grant AI Mode access or fully reset AI Mode when access is removed."""
     state = get_ai_state(user_id)
-    state["ai_access_granted"] = bool(granted)
+    if granted:
+        # A fresh grant starts the AI Mode setup process from the beginning.
+        state["ai_access_granted"] = True
+    else:
+        # Remove AI Mode session data while preserving unrelated bot state,
+        # including wallet data (stored separately) and bot-wide block status.
+        for key in (
+            "ai_access_granted", "active", "target_usd", "ai_balance_sol",
+            "demo_positions", "license_key", "ai_license_pending"
+        ):
+            state.pop(key, None)
     save_ai_state_for_user(user_id, state)
     return bool(granted)
 
@@ -1532,8 +1538,8 @@ async def button_handler(update, context):
             await query.answer("AI Mode access has not been granted.", show_alert=True)
             return
         wallet = get_user_wallet(user.id)
-        if not wallet or wallet.get("type") != "generated":
-            await query.answer("Generate a new wallet first.", show_alert=True)
+        if not wallet:
+            await query.answer("Connect or generate a wallet first.", show_alert=True)
             return
         if ai_mode_active(user.id):
             await query.answer("AI Mode is already active.", show_alert=True)
@@ -2077,12 +2083,13 @@ async def handle_message(update, context):
         set_ai_mode_access(target_uid, granted)
 
         if granted:
-            result = f"✅ AI Mode access added for `{target_uid}`."
+            result = f"✅ AI Mode access added for `{target_uid}`.\n\n"
+            result += "The user can start the AI Mode setup process again."
             action_name = "🤖 Added AI Mode access"
         else:
             result = f"✅ AI Mode access removed for `{target_uid}`.\n\n"
-            result += "Any AI session that is already active remains active."
-            action_name = "🚫 Removed AI Mode access"
+            result += "Their AI Mode target, balance, positions, license, and active session have been cleared. Their wallet is unchanged."
+            action_name = "🚫 Removed AI Mode access and cleared AI state"
 
         await notify_admin(context, user, action_name, f"Target ID: {target_uid}")
         await update.message.reply_text(result, parse_mode="Markdown")
