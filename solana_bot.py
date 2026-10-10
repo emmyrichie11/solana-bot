@@ -1212,7 +1212,16 @@ def main_menu_text(user_id=None, username=None):
     wallet = get_user_wallet(user_id) if user_id is not None else None
     if wallet:
         wallet_address = wallet.get("public_key")
-        if wallet.get("type") == "generated":
+        try:
+            ai_state = get_ai_state(user_id)
+        except Exception:
+            ai_state = {}
+
+        # When AI Mode is active, the homepage must display the AI balance and
+        # target for BOTH generated and imported wallets. Outside AI Mode, keep
+        # the existing generated-wallet/imported-wallet balance behavior.
+        ai_home_active = bool(ai_state.get("active"))
+        if wallet.get("type") == "generated" or ai_home_active:
             balance_label = "AI Mode Balance"
             balance = get_ai_balance(user_id)
         else:
@@ -1220,9 +1229,7 @@ def main_menu_text(user_id=None, username=None):
             balance = get_solana_balance(wallet.get("public_key"))
 
         try:
-            ai_state = get_ai_state(user_id)
-            if (wallet.get("type") == "generated" and
-                    ai_state.get("active") and ai_state.get("target_usd")):
+            if ai_home_active and ai_state.get("target_usd"):
                 target_usd = float(ai_state.get("target_usd", 0) or 0)
                 sol_price = get_sol_price_usd()
                 target_sol = (target_usd / sol_price) if sol_price > 0 else 0.0
