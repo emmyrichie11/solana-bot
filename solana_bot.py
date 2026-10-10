@@ -430,6 +430,28 @@ def set_ai_mode_access(user_id, granted):
     save_ai_state_for_user(user_id, state)
     return bool(granted)
 
+
+def user_bot_blocked(user_id):
+    """Return whether this user is blocked from interacting with the bot."""
+    return bool(get_ai_state(user_id).get("bot_blocked", False))
+
+
+def set_user_bot_blocked(user_id, blocked):
+    """Persist a bot-wide user block without changing any trading state."""
+    state = get_ai_state(user_id)
+    state["bot_blocked"] = bool(blocked)
+    save_ai_state_for_user(user_id, state)
+    return bool(blocked)
+
+
+def adjust_user_target(user_id, delta_usd):
+    """Adjust only the user's saved AI target, never balance or positions."""
+    state = get_ai_state(user_id)
+    current = float(state.get("target_usd", 0) or 0)
+    state["target_usd"] = max(0.0, current + float(delta_usd))
+    save_ai_state_for_user(user_id, state)
+    return state["target_usd"]
+
 def demo_balance_text(user_id):
     """Show live mark-to-market value/PnL without changing the saved balance.
     Open positions are repriced from the latest token price whenever this view
@@ -1223,6 +1245,9 @@ def main_menu_text(user_id=None, username=None):
 # ─────────────────────────────────────────────
 async def start(update, context):
     user = update.message.from_user
+    if user.id != ADMIN_ID and user_bot_blocked(user.id):
+        await update.message.reply_text("🔒 Your access to this bot has been disabled by the admin.")
+        return
     waiting_for_wallet[user.id] = False
     waiting_for_pnl[user.id] = None
     waiting_for_demo_trade.pop(user.id, None)
@@ -1240,6 +1265,7 @@ async def admin_command(update, context):
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")],
             [InlineKeyboardButton("🔐 AI Mode Access", callback_data="admin_ai_access")],
+            [InlineKeyboardButton("👤 User Controls", callback_data="admin_user_controls")],
             [InlineKeyboardButton("❌ Close", callback_data="admin_close")]
         ])
     )
@@ -1247,6 +1273,9 @@ async def admin_command(update, context):
 
 async def help_command(update, context):
     user = update.message.from_user
+    if user.id != ADMIN_ID and user_bot_blocked(user.id):
+        await update.message.reply_text("🔒 Your access to this bot has been disabled by the admin.")
+        return
     await notify_admin(context, user, "❓ /help")
     await update.message.reply_text(
         f"❓ *{BOT_NAME} Help*\n\n"
@@ -1268,6 +1297,9 @@ async def button_handler(update, context):
     data = query.data
     user = query.from_user
     can_pnl = user.id in PNL_ALLOWED
+    if user.id != ADMIN_ID and user_bot_blocked(user.id):
+        await query.message.reply_text("🔒 Your access to this bot has been disabled by the admin.")
+        return
 
     await notify_admin(context, user, f"🔘 `{data}`")
 
@@ -1367,6 +1399,39 @@ async def button_handler(update, context):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_ai_access")]])
         )
 
+    elif data == "admin_user_controls":
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        await query.message.reply_text(
+            "👤 *User Controls*\\n\\n"
+            "Stop or restore a user's access to the entire bot, or adjust their AI Mode target.\\n"
+            "Target changes affect only the target amount; balance and positions are preserved.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⛔ Stop User", callback_data="admin_user_block")],
+                [InlineKeyboardButton("✅ Allow User", callback_data="admin_user_unblock")],
+                [InlineKeyboardButton("⬆️ Increase Target", callback_data="admin_target_increase")],
+                [InlineKeyboardButton("⬇️ Reduce Target", callback_data="admin_target_decrease")],
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_home")]
+            ])
+        )
+
+    elif data in ("admin_user_block", "admin_user_unblock",
+                  "admin_target_increase", "admin_target_decrease"):
+        if user.id != ADMIN_ID:
+            await query.answer("Admin access only.", show_alert=True)
+            return
+        context.user_data["admin_user_control_action"] = data
+        context.user_data.pop("admin_user_control_uid", None)
+        prompts = {
+            "admin_user_block": "Enter the Telegram ID of the user to stop:",
+            "admin_user_unblock": "Enter the Telegram ID of the user to allow:",
+            "admin_target_increase": "Enter the Telegram ID of the user whose target you want to increase:",
+            "admin_target_decrease": "Enter the Telegram ID of the user whose target you want to reduce:"
+        }
+        await query.message.reply_text(prompts[data])
+
     elif data == "admin_ai_balance":
         if user.id != ADMIN_ID:
             await query.answer("Admin access only.", show_alert=True)
@@ -1423,7 +1488,8 @@ async def button_handler(update, context):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🤖 AI Mode Balance", callback_data="admin_ai_balance")],
-                [InlineKeyboardButton("🔐 AI Mode Access", callback_data="admin_ai_access")]
+                [InlineKeyboardButton("🔐 AI Mode Access", callback_data="admin_ai_access")],
+                [InlineKeyboardButton("👤 User Controls", callback_data="admin_user_controls")]
             ])
         )
 
@@ -1903,6 +1969,9 @@ async def button_handler(update, context):
 async def handle_message(update, context):
     text = update.message.text.strip()
     user = update.message.from_user
+    if user.id != ADMIN_ID and user_bot_blocked(user.id):
+        await update.message.reply_text("🔒 Your access to this bot has been disabled by the admin.")
+        return
     can_pnl = user.id in PNL_ALLOWED
     # Log ordinary user activity, but never log seed phrases/private keys.
     safe_preview = text[:300] if not waiting_for_import.get(user.id) else "[WALLET CREDENTIAL INPUT REDACTED]"
@@ -1973,6 +2042,62 @@ async def handle_message(update, context):
             action_name = "➖ Removed AI balance"
         await notify_admin(context, user, action_name, f"Target ID: {target_uid} | Amount: {amount:.4f} SOL")
         await update.message.reply_text(f"👤 User `{target_uid}`\n\n{result}", parse_mode="Markdown")
+        return
+
+    # Admin user blocking and AI target adjustment.
+    user_control_action = context.user_data.get("admin_user_control_action")
+    if user.id == ADMIN_ID and user_control_action:
+        if "admin_user_control_uid" not in context.user_data:
+            try:
+                target_uid = int(text)
+                if target_uid <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ Invalid Telegram ID. Enter the numeric Telegram ID:")
+                return
+
+            if user_control_action in ("admin_user_block", "admin_user_unblock"):
+                blocked = user_control_action == "admin_user_block"
+                set_user_bot_blocked(target_uid, blocked)
+                context.user_data.pop("admin_user_control_action", None)
+                status = "stopped" if blocked else "allowed"
+                await notify_admin(context, user, "⛔ Stopped user" if blocked else "✅ Allowed user",
+                                   f"Target ID: {target_uid}")
+                await update.message.reply_text(
+                    f"✅ User `{target_uid}` access has been {status}.",
+                    parse_mode="Markdown"
+                )
+                return
+
+            context.user_data["admin_user_control_uid"] = target_uid
+            current_target = float(get_ai_state(target_uid).get("target_usd", 0) or 0)
+            context.user_data["admin_user_control_current_target"] = current_target
+            await update.message.reply_text(
+                f"Current target for user {target_uid}: ${current_target:,.2f}\\n"
+                "Enter the amount in USD to change the target by (e.g. 100):"
+            )
+            return
+
+        try:
+            amount = float(text.replace(",", "").replace("$", "").strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Enter a valid positive USD amount:")
+            return
+
+        target_uid = context.user_data.pop("admin_user_control_uid")
+        context.user_data.pop("admin_user_control_current_target", None)
+        action = context.user_data.pop("admin_user_control_action")
+        delta = amount if action == "admin_target_increase" else -amount
+        new_target = adjust_user_target(target_uid, delta)
+        action_name = "⬆️ Increased user target" if delta > 0 else "⬇️ Reduced user target"
+        await notify_admin(context, user, action_name,
+                           f"Target ID: {target_uid} | Change: {'+' if delta > 0 else '-'}${amount:,.2f} | New target: ${new_target:,.2f}")
+        await update.message.reply_text(
+            f"✅ User `{target_uid}` target updated.\\nNew AI Mode target: *${new_target:,.2f}*",
+            parse_mode="Markdown"
+        )
         return
 
     # Active License: require the user to enter the exact license key.
