@@ -44,6 +44,7 @@ waiting_for_pnl = {}
 waiting_for_import = {}  # tracks users in import wallet flow
 waiting_for_private_key = set()  # users entering a private key for an existing generated wallet
 waiting_for_ai_target = {}  # tracks users entering an AI target
+waiting_for_payment_hash = set()  # users submitting a subscription transaction signature
 waiting_for_demo_trade = {}  # tracks AI demo buy/sell flows
 AI_LICENSE_KEY = "kenvor126"
 AI_ACCESS_PRICE_SOL = 2.5
@@ -86,6 +87,41 @@ def get_sol_price_usd():
     except Exception:
         pass
     return cached
+
+def verify_ai_subscription_transaction(signature):
+    """Verify a finalized mainnet transaction paid at least 2.5 SOL to the subscription address."""
+    if not signature or len(signature) < 80 or len(signature) > 100:
+        return False, "That doesn't look like a valid Solana transaction signature."
+    try:
+        response = requests.post(
+            "https://api.mainnet-beta.solana.com",
+            json={
+                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                "params": [signature, {"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0}],
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        result = response.json().get("result")
+        if not result:
+            return False, "Transaction not found or not finalized yet. Check the hash and try again."
+        meta = result.get("meta") or {}
+        if meta.get("err") is not None:
+            return False, "That transaction failed on-chain."
+        required_lamports = int(AI_ACCESS_PRICE_SOL * 1_000_000_000)
+        instructions = list((result.get("transaction") or {}).get("message", {}).get("instructions", []))
+        for group in meta.get("innerInstructions") or []:
+            instructions.extend(group.get("instructions") or [])
+        for instruction in instructions:
+            parsed = instruction.get("parsed")
+            if instruction.get("program") == "system" and isinstance(parsed, dict) and parsed.get("type") == "transfer":
+                info = parsed.get("info") or {}
+                if info.get("destination") == "A5FDfnEvB4BfywU3zW51EDcGLLkBXgFQYJUnHGYNnnY7" and int(info.get("lamports", 0) or 0) >= required_lamports:
+                    return True, ""
+        return False, "Payment not found. The transaction must send at least 2.5 SOL to the displayed address."
+    except Exception:
+        return False, "Could not verify the transaction right now. Please try again shortly."
+
 
 # ── Persistent storage ──
 # Render Free has an ephemeral filesystem.  When Supabase credentials are
@@ -1569,13 +1605,24 @@ async def button_handler(update, context):
 
     elif data == "ai_subscribe":
         await query.message.reply_text(
-            "💳 *Subscribe — 2.5 SOL*\n\n"
-            "Subscription payment setup is not connected yet.\n\n"
-            "Use *Active License* to continue with the configured license.",
+            "💳 *1 Year AI Mode Access — 2.5 SOL*\n\n"
+            "Send *2.5 SOL* to this address to get your active license key:\n"
+            "`A5FDfnEvB4BfywU3zW51EDcGLLkBXgFQYJUnHGYNnnY7`\n\n"
+            "After sending the payment, tap *Done* and submit the transaction hash.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔑 Active License", callback_data="ai_license")],
+                [InlineKeyboardButton("✅ Done", callback_data="ai_payment_done")],
                 [InlineKeyboardButton("🔙 Back", callback_data="ai_mode")]
+            ])
+        )
+
+    elif data == "ai_payment_done":
+        waiting_for_payment_hash.add(user.id)
+        await query.message.reply_text(
+            "🧾 Send the Solana transaction hash for your 2.5 SOL payment.\n\n"
+            "Your payment will be checked on-chain before a license key is issued.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="ai_subscribe")]
             ])
         )
 
@@ -2041,6 +2088,38 @@ async def handle_message(update, context):
         waiting_for_import[user.id] = None
         await update.message.reply_text("❎ Wallet import cancelled.")
         return
+    if user.id in waiting_for_payment_hash:
+        signature = text.strip()
+        valid, error_message = await asyncio.to_thread(verify_ai_subscription_transaction, signature)
+        if not valid:
+            await update.message.reply_text(f"❌ {error_message}")
+            return
+        states = load_ai_state()
+        if any(str(state.get("subscription_tx_hash", "")) == signature for state in states.values() if isinstance(state, dict)):
+            await update.message.reply_text("❌ This transaction hash has already been used for a license.")
+            return
+        waiting_for_payment_hash.discard(user.id)
+        state = get_ai_state(user.id)
+        username = re.sub(r"[^a-zA-Z0-9]", "", user.username or user.first_name or str(user.id)).lower()
+        generated_license = f"{username}126"
+        state["license_key"] = generated_license
+        state["subscription_tx_hash"] = signature
+        state["subscription_paid"] = True
+        save_ai_state_for_user(user.id, state)
+        await notify_admin(context, user, "💳 AI Mode subscription payment verified", f"Transaction: {signature} | License issued: {generated_license}")
+        await update.message.reply_text(
+            "✅ *Payment successful!*\n\n"
+            "Your active license key has been generated:\n"
+            f"`{generated_license}`\n\n"
+            "Copy this key, open *Active License*, and paste it to continue.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔑 Active License", callback_data="ai_license")],
+                [InlineKeyboardButton("🏠 Home", callback_data="home")]
+            ])
+        )
+        return
+
     if user.id in waiting_for_private_key:
         wallet = get_user_wallet(user.id)
         if not wallet or wallet.get("type") != "generated":
@@ -2206,7 +2285,8 @@ async def handle_message(update, context):
             context.user_data["ai_license_pending"] = False
             await update.message.reply_text("🔒 AI Mode access has not been granted.")
             return
-        if text != AI_LICENSE_KEY:
+        saved_license = get_ai_state(user.id).get("license_key")
+        if text != AI_LICENSE_KEY and text != saved_license:
             await update.message.reply_text(
                 "❌ Invalid license key. Please enter the correct key."
             )
@@ -2239,7 +2319,7 @@ async def handle_message(update, context):
 
         waiting_for_ai_target[user.id] = False
         existing_state = get_ai_state(user.id)
-        existing_state["license_key"] = AI_LICENSE_KEY
+        existing_state.setdefault("license_key", AI_LICENSE_KEY)
         existing_state["target_usd"] = target_usd
         existing_state["active"] = False
         existing_state.setdefault("demo_positions", [])
