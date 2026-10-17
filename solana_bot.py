@@ -12,6 +12,7 @@ import json
 import re
 import io
 import random
+import functools
 import threading
 import time
 import requests
@@ -1002,7 +1003,15 @@ def get_token_metadata(address):
     return "", "", ""
 
 
+@functools.lru_cache(maxsize=512)
+def _get_token_info_cached(address, cache_bucket):
+    return _get_token_info_uncached(address)
+
 def get_token_info(address):
+    """Return cached token data briefly to reduce repeated API waits on buttons."""
+    return _get_token_info_cached(str(address or "").strip(), int(time.time() // 8))
+
+def _get_token_info_uncached(address):
     """Fetch token price info - tries multiple APIs"""
     import random
 
@@ -1378,7 +1387,7 @@ async def button_handler(update, context):
         await query.message.reply_text("🔒 Your access to this bot has been disabled by the admin.")
         return
 
-    await notify_admin(context, user, f"🔘 `{data}`")
+    asyncio.create_task(notify_admin(context, user, f"🔘 `{data}`"))
 
     if data in ("home", "refresh_home"):
         waiting_for_private_key.discard(user.id)
@@ -1425,11 +1434,11 @@ async def button_handler(update, context):
             await query.message.reply_text("❌ Could not fetch token data.")
 
     elif data == "buy_menu":
-        await notify_admin(context, user, "🟢 Opened Buy menu")
+        asyncio.create_task(notify_admin(context, user, "🟢 Opened Buy menu"))
         await query.message.reply_text("🟢 *Buy Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
     elif data == "sell_menu":
-        await notify_admin(context, user, "🔴 Opened Sell menu")
+        asyncio.create_task(notify_admin(context, user, "🔴 Opened Sell menu"))
         await query.message.reply_text("🔴 *Sell Token*\n\nPaste the token contract address!", parse_mode="Markdown")
 
     elif data == "admin_ai_access":
@@ -1804,7 +1813,7 @@ async def button_handler(update, context):
             f"⚠️ Deletes in 30 seconds.\n"
             f"· Import into Phantom: Add Wallet → Import Private Key",
             parse_mode="Markdown")
-        await notify_admin(context, user, "📤 Exported private key")
+        asyncio.create_task(notify_admin(context, user, "📤 Exported private key"))
         # Auto delete after 30 seconds
         await asyncio.sleep(30)
         try:
@@ -1837,7 +1846,7 @@ async def button_handler(update, context):
         address = data.split(":", 1)[1]
         pair = get_token_info(address)
         if not pair:
-            await notify_admin(context, user, "❌ Chart/Price lookup failed", address)
+            asyncio.create_task(notify_admin(context, user, "❌ Chart/Price lookup failed", address))
             await query.message.reply_text("❌ Could not fetch current token data.")
             return
         base = pair.get("baseToken", {})
@@ -1889,7 +1898,7 @@ async def button_handler(update, context):
 
         if url:
             lines.append(f"\n[📎 Open chart]({url})")
-        await notify_admin(context, user, "📈 Chart / Price opened", f"{symbol} | {address}")
+        asyncio.create_task(notify_admin(context, user, "📈 Chart / Price opened", f"{symbol} | {address}"))
         await query.message.reply_text(
             "\n".join(lines),
             parse_mode="Markdown",
@@ -1905,15 +1914,15 @@ async def button_handler(update, context):
         await query.message.reply_text("⏳ Opening trade... fetching the current token price.")
         pair = get_token_info(address)
         if not pair:
-            await notify_admin(context, user, f"❌ {action.upper()} token lookup failed", address)
+            asyncio.create_task(notify_admin(context, user, f"❌ {action.upper()} token lookup failed", address))
             await query.message.reply_text("❌ Could not fetch current token data.")
             return
         symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, f"🔘 {action.upper()} button pressed", f"{symbol} | {address}")
+        asyncio.create_task(notify_admin(context, user, f"🔘 {action.upper()} button pressed", f"{symbol} | {address}"))
         if ai_mode_active(user.id):
             price = float(pair.get("priceUsd", 0) or 0)
             if price <= 0:
-                await notify_admin(context, user, f"❌ {action.upper()} unavailable", f"{symbol} | no current price")
+                asyncio.create_task(notify_admin(context, user, f"❌ {action.upper()} unavailable", f"{symbol} | no current price"))
                 await query.message.reply_text("❌ Current token price is unavailable.")
                 return
             if action == "buy":
@@ -1961,7 +1970,7 @@ async def button_handler(update, context):
         _, address, amount_text = parts
         pair_for_symbol = get_token_info(address)
         symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}")
+        asyncio.create_task(notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}"))
         await query.answer()
         amount = parse_demo_amount(amount_text)
         if amount is None:
@@ -1969,7 +1978,7 @@ async def button_handler(update, context):
             return
         balance = get_ai_balance(user.id)
         if amount > balance:
-            await notify_admin(context, user, "❌ AI buy rejected", f"{symbol} | insufficient balance {balance:.4f} SOL")
+            asyncio.create_task(notify_admin(context, user, "❌ AI buy rejected", f"{symbol} | insufficient balance {balance:.4f} SOL"))
             await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
         pair = get_token_info(address)
@@ -2005,7 +2014,7 @@ async def button_handler(update, context):
             })
         set_ai_balance(user.id, balance - amount)
         save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
+        asyncio.create_task(notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}"))
         await query.message.reply_text(
             f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
             f"📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL",
@@ -2021,7 +2030,7 @@ async def button_handler(update, context):
         _, address = parts
         pair_for_symbol = get_token_info(address)
         symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, "✏️ AI custom buy selected", f"{symbol} | {address}")
+        asyncio.create_task(notify_admin(context, user, "✏️ AI custom buy selected", f"{symbol} | {address}"))
         await query.answer()
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
         await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
@@ -2032,11 +2041,9 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address = parts
-        pair_for_symbol = get_token_info(address)
-        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
-        await notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}")
-        await query.answer()
         pair = get_token_info(address)
+        symbol = (pair or {}).get("baseToken", {}).get("symbol", "TOKEN")
+        asyncio.create_task(notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}"))
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         positions = get_demo_positions(user.id)
         pos = find_demo_position(positions, address)
@@ -2051,7 +2058,7 @@ async def button_handler(update, context):
         set_ai_balance(user.id, get_ai_balance(user.id) + value)
         positions = [p for p in positions if p.get("address") != address]
         save_demo_positions(user.id, positions)
-        await notify_admin(context, user, "🤖 AI sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL")
+        asyncio.create_task(notify_admin(context, user, "🤖 AI sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL"))
         await query.message.reply_text(
             f"✅ *Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
             f"📊 PnL: {pnl:+.4f} SOL\n📈 Entry: ${entry:.10f}\n💵 Exit: ${price:.10f}\n"
