@@ -2059,13 +2059,33 @@ async def button_handler(update, context):
         positions = [p for p in positions if p.get("address") != address]
         save_demo_positions(user.id, positions)
         asyncio.create_task(notify_admin(context, user, "🤖 AI sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL"))
-        await query.message.reply_text(
-            f"✅ *Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
-            f"📊 PnL: {pnl:+.4f} SOL\n📈 Entry: ${entry:.10f}\n💵 Exit: ${price:.10f}\n"
-            f"💰 Balance: {get_ai_balance(user.id):.4f} SOL",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
-        )
+
+        # Check whether the user's AI Mode balance has reached their USD target.
+        ai_state = get_ai_state(user.id)
+        target_usd = float(ai_state.get("target_usd", 0) or 0)
+        sol_price = get_sol_price_usd()
+        current_balance_usd = get_ai_balance(user.id) * sol_price if sol_price > 0 else 0.0
+        target_reached = target_usd > 0 and current_balance_usd >= target_usd
+        if target_reached:
+            ai_state["active"] = False
+            save_ai_state_for_user(user.id, ai_state)
+            await query.message.reply_text(
+                "🎯 *Target Reached!*\n\n"
+                "Congratulations — you've hit your target and completed the AI Target Trading program.\n\n"
+                "You're now back on your main dashboard.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Home", callback_data="home")]
+                ])
+            )
+        else:
+            await query.message.reply_text(
+                f"✅ *Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
+                f"📊 PnL: {pnl:+.4f} SOL\n📈 Entry: ${entry:.10f}\n💵 Exit: ${price:.10f}\n"
+                f"💰 Balance: {get_ai_balance(user.id):.4f} SOL",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
+            )
         # Closed-trade PnL card: uses the same artwork/template as the main PnL card.
         await send_closed_pnl_card(context, user, query.message, pos, pair, price, value, pnl)
 
