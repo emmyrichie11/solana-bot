@@ -515,7 +515,9 @@ async def monitor_ai_tpsl(context):
                     invested = float(pos.get("amount_sol") or 0)
                     if not address or entry <= 0 or tokens <= 0 or (tp_pct <= 0 and sl_pct <= 0):
                         continue
-                    pair = get_token_info(address)
+                    # Price lookups use synchronous HTTP internally; run them in a
+                    # worker thread so a slow market-data API does not freeze Telegram replies.
+                    pair = await asyncio.to_thread(get_token_info, address)
                     price = float(pair.get("priceUsd") or 0) if pair else 0
                     if price <= 0:
                         continue
@@ -571,7 +573,8 @@ async def ai_tpsl_monitor_loop(app):
     """Background loop so AI Mode TP/SL keeps monitoring after setup."""
     while True:
         await monitor_ai_tpsl(type("MonitorContext", (), {"bot": app.bot})())
-        await asyncio.sleep(15)
+        # Check more frequently while keeping network requests off the bot event loop.
+        await asyncio.sleep(5)
 
 
 async def start_ai_tpsl_monitor(app):
@@ -1567,7 +1570,7 @@ async def button_handler(update, context):
             await query.message.reply_text("🔒 *PnL Card is for selected users only.*", parse_mode="Markdown")
             return
         address = data.split(":")[1]
-        pair = get_token_info(address)
+        pair = await asyncio.to_thread(get_token_info, address)
         if pair:
             base_token = pair.get("baseToken", {})
             name = base_token.get("name", "Unknown")
@@ -1831,7 +1834,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active yet.", show_alert=True)
             return
         await query.message.reply_text(
-            "🤖 *AI Trading*\n\n" + demo_balance_text(user.id),
+            "🤖 *AI Trading*\n\n" + await asyncio.to_thread(demo_balance_text, user.id),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Refresh Prices", callback_data="ai_demo_balance"),
@@ -1996,7 +1999,7 @@ async def button_handler(update, context):
 
     elif data.startswith("chart:"):
         address = data.split(":", 1)[1]
-        pair = get_token_info(address)
+        pair = await asyncio.to_thread(get_token_info, address)
         if not pair:
             asyncio.create_task(notify_admin(context, user, "❌ Chart/Price lookup failed", address))
             await query.message.reply_text("❌ Could not fetch current token data.")
@@ -2066,7 +2069,7 @@ async def button_handler(update, context):
     elif data.startswith("buy:") or data.startswith("sell:"):
         action, address = data.split(":", 1)
         await query.message.reply_text("⏳ Opening trade... fetching the current token price.")
-        pair = get_token_info(address)
+        pair = await asyncio.to_thread(get_token_info, address)
         if not pair:
             asyncio.create_task(notify_admin(context, user, f"❌ {action.upper()} token lookup failed", address))
             await query.message.reply_text("❌ Could not fetch current token data.")
@@ -2082,7 +2085,7 @@ async def button_handler(update, context):
             if action == "buy":
                 await query.message.reply_text(
                     f"🤖 *Buy — {symbol}*\n\n"
-                    f"{demo_balance_text(user.id)}\n\n"
+                    f"{await asyncio.to_thread(demo_balance_text, user.id)}\n\n"
                     "Choose how much SOL to use:",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
@@ -2122,7 +2125,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address, amount_text = parts
-        pair_for_symbol = get_token_info(address)
+        pair_for_symbol = await asyncio.to_thread(get_token_info, address)
         symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}"))
         await query.answer()
@@ -2135,7 +2138,7 @@ async def button_handler(update, context):
             asyncio.create_task(notify_admin(context, user, "❌ AI buy rejected", f"{symbol} | insufficient balance {balance:.4f} SOL"))
             await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
-        pair = get_token_info(address)
+        pair = await asyncio.to_thread(get_token_info, address)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         if price <= 0:
             await query.message.reply_text("❌ Current token price is unavailable.")
@@ -2185,7 +2188,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address = parts
-        pair_for_symbol = get_token_info(address)
+        pair_for_symbol = await asyncio.to_thread(get_token_info, address)
         symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "✏️ AI custom buy selected", f"{symbol} | {address}"))
         await query.answer()
@@ -2219,7 +2222,7 @@ async def button_handler(update, context):
             await query.answer("AI Mode is not active.", show_alert=True)
             return
         _, address = parts
-        pair = get_token_info(address)
+        pair = await asyncio.to_thread(get_token_info, address)
         symbol = (pair or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}"))
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
@@ -2270,7 +2273,7 @@ async def button_handler(update, context):
 
     elif data.startswith("refresh:"):
         address = data.split(":")[1]
-        pair = get_token_info(address)
+        pair = await asyncio.to_thread(get_token_info, address)
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
             await query.message.edit_text(
@@ -2543,7 +2546,9 @@ async def handle_message(update, context):
         return
 
     tpsl_pending = waiting_for_ai_tpsl.get(user.id)
-    if tpsl_pending and ai_mode_active(user.id):
+    # Finish an already-started TP/SL setup even if the AI active flag is
+    # temporarily stale in persisted state; the pending prompt is authoritative.
+    if tpsl_pending:
         parsed = parse_ai_tpsl_input(text)
         if parsed is None:
             await update.message.reply_text(
@@ -2583,7 +2588,7 @@ async def handle_message(update, context):
         waiting_for_demo_trade.pop(user.id, None)
         address = demo_pending["address"]
         symbol = demo_pending["symbol"]
-        pair = get_token_info(address)
+        pair = await asyncio.to_thread(get_token_info, address)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         balance = get_ai_balance(user.id)
         if price <= 0:
@@ -2615,7 +2620,7 @@ async def handle_message(update, context):
     if pnl_state and pnl_state.get("step") == "address":
         if is_valid_solana_address(text):
             await update.message.reply_text("🔍 Fetching token info...")
-            pair = get_token_info(text)
+            pair = await asyncio.to_thread(get_token_info, text)
             if pair:
                 base_token = pair.get("baseToken", {})
                 name = base_token.get("name", "Unknown")
@@ -2730,7 +2735,7 @@ async def handle_message(update, context):
 
     if is_valid_solana_address(text):
         await update.message.reply_text("🔍 Scanning token...")
-        pair = get_token_info(text)
+        pair = await asyncio.to_thread(get_token_info, text)
         if pair:
             symbol = pair.get("baseToken",{}).get("symbol","TOKEN")
             await notify_admin(context, user, f"🔍 Scanned: {symbol}", text)
