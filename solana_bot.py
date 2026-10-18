@@ -385,6 +385,10 @@ def _row_to_ai_state(row):
         state["demo_positions"] = row.get("demo_positions")
     return state
 
+_AI_STATE_CACHE = {"db": None, "ts": 0.0}
+_AI_STATE_CACHE_LOCK = threading.RLock()
+_AI_STATE_CACHE_TTL = 5.0
+
 def load_ai_state():
     """Load AI state from local cache and hydrate/merge Supabase state.
 
@@ -430,6 +434,22 @@ def load_ai_state():
         # Never turn a temporary Supabase/network failure into a state reset.
         pass
     return local
+
+def _persist_ai_state_remote(db):
+    """Mirror a snapshot to Supabase off the Telegram event loop."""
+    if not _supabase_enabled():
+        return
+    for uid, state in db.items():
+        try:
+            _supabase_upsert_user(uid, {
+                "ai_active": bool(state.get("active", False)),
+                "ai_balance": float(state.get("ai_balance_sol", 0) or 0),
+                "target_balance": float(state.get("target_usd", 0) or 0),
+                "demo_positions": state.get("demo_positions", []),
+                "state_json": state,
+            })
+        except Exception:
+            pass
 
 def save_ai_state(db):
     with open(AI_DB_FILE, "w") as f:
