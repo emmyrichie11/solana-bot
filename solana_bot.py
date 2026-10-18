@@ -1,6 +1,6 @@
 import html
 import asyncio
-# trigger redeploy v22
+# trigger redeploy v23 - AI Mode TP/SL
 """
 ApeRadarX Solana Telegram Bot
 PnL Card uses reference background image
@@ -47,6 +47,7 @@ waiting_for_private_key = set()  # users entering a private key for an existing 
 waiting_for_ai_target = {}  # tracks users entering an AI target
 waiting_for_payment_hash = set()  # users submitting a subscription transaction signature
 waiting_for_demo_trade = {}  # tracks AI demo buy/sell flows
+waiting_for_ai_tpsl = {}  # tracks AI Mode TP/SL setup prompts
 AI_LICENSE_KEY = "kenvor126"
 AI_ACCESS_PRICE_SOL = 2.5
 AI_DB_FILE = "ai_mode.json"
@@ -476,6 +477,115 @@ def save_demo_positions(user_id, positions):
     state = get_ai_state(user_id)
     state["demo_positions"] = positions
     save_ai_state_for_user(user_id, state)
+
+
+def parse_ai_tpsl_input(value):
+    """Parse TP/SL percentages; both are optional, but not both empty/zero."""
+    parts = [part.strip().replace("%", "") for part in str(value or "").split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        tp = float(parts[0]) if parts[0] else 0.0
+        sl = float(parts[1]) if parts[1] else 0.0
+    except (TypeError, ValueError):
+        return None
+    if tp < 0 or sl < 0 or tp > 100000 or sl > 99.99 or (tp == 0 and sl == 0):
+        return None
+    return tp or None, sl or None
+
+
+async def monitor_ai_tpsl(context):
+    """Automatically close AI Mode positions when their saved TP/SL triggers."""
+    try:
+        db = load_ai_state()
+        for uid, state in list(db.items()):
+            if not isinstance(state, dict) or not state.get("active"):
+                continue
+            positions = state.get("demo_positions", [])
+            if not isinstance(positions, list) or not positions:
+                continue
+            changed = False
+            for pos in list(positions):
+                try:
+                    tp_pct = float(pos.get("tp_pct") or 0)
+                    sl_pct = float(pos.get("sl_pct") or 0)
+                    entry = float(pos.get("entry_price") or 0)
+                    address = str(pos.get("address") or "")
+                    tokens = float(pos.get("tokens") or 0)
+                    invested = float(pos.get("amount_sol") or 0)
+                    if not address or entry <= 0 or tokens <= 0 or (tp_pct <= 0 and sl_pct <= 0):
+                        continue
+                    pair = get_token_info(address)
+                    price = float(pair.get("priceUsd") or 0) if pair else 0
+                    if price <= 0:
+                        continue
+                    reason = None
+                    if tp_pct > 0 and price >= entry * (1 + tp_pct / 100.0):
+                        reason = "TAKE PROFIT"
+                    elif sl_pct > 0 and price <= entry * (1 - sl_pct / 100.0):
+                        reason = "STOP LOSS"
+                    if not reason:
+                        continue
+                    value = tokens * price
+                    pnl = value - invested
+                    # Remove first and persist before notifying, avoiding duplicate sells
+                    # if a notification or price request fails during this iteration.
+                    positions[:] = [p for p in positions if p is not pos]
+                    state["demo_positions"] = positions
+                    state["ai_balance_sol"] = max(0.0, float(state.get("ai_balance_sol", 0) or 0) + value)
+                    save_ai_state_for_user(uid, state)
+                    changed = True
+                    symbol = pos.get("symbol", "TOKEN")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=int(uid),
+                            text=(f"🤖 *AI Mode {reason} triggered*\n\n🪙 {symbol}\n"
+                                  f"💵 Exit price: ${price:.10f}\n💰 Received: {value:.4f} SOL\n"
+                                  f"📊 PnL: {pnl:+.4f} SOL\n💰 Balance: {float(state.get('ai_balance_sol', 0)):.4f} SOL"),
+                            parse_mode="Markdown",
+                            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance"), InlineKeyboardButton("🏠 Start", callback_data="home")]])
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_ID,
+                            text=(f"📡 Activity Log\n\n👤 AI Mode auto-sell\n🆔 User ID: {uid}\n"
+                                  f"🔘 Action: 🤖 AI Mode {reason} auto-sell\n"
+                                  f"📝 {symbol} | {address} | Exit ${price:.10f} | PnL {pnl:+.4f} SOL")
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    continue
+            if changed:
+                # Keep the user's remaining positions persisted after processing.
+                state["demo_positions"] = positions
+                save_ai_state_for_user(uid, state)
+    except Exception:
+        # Monitoring must not stop the bot if a data source is temporarily unavailable.
+        pass
+
+
+async def ai_tpsl_monitor_loop(app):
+    """Background loop so AI Mode TP/SL keeps monitoring after setup."""
+    while True:
+        await monitor_ai_tpsl(type("MonitorContext", (), {"bot": app.bot})())
+        await asyncio.sleep(15)
+
+
+async def start_ai_tpsl_monitor(app):
+    app.bot_data["ai_tpsl_task"] = asyncio.create_task(ai_tpsl_monitor_loop(app))
+
+
+async def stop_ai_tpsl_monitor(app):
+    task = app.bot_data.get("ai_tpsl_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 def ai_mode_active(user_id):
     return bool(get_ai_state(user_id).get("active"))
@@ -1945,10 +2055,12 @@ async def button_handler(update, context):
             "\n".join(lines),
             parse_mode="Markdown",
             disable_web_page_preview=True,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Refresh", callback_data=f"chart:{address}"),
-                 InlineKeyboardButton("🏠 Main Menu", callback_data="home")]
-            ])
+            reply_markup=InlineKeyboardMarkup(
+                ([[InlineKeyboardButton("🎯 Set TP/SL", callback_data=f"ai_tpsl:{address}")]] if ai_mode_active(user.id) and find_demo_position(get_demo_positions(user.id), address) else []) + [
+                    [InlineKeyboardButton("🔄 Refresh", callback_data=f"chart:{address}"),
+                     InlineKeyboardButton("🏠 Main Menu", callback_data="home")]
+                ]
+            )
         )
 
     elif data.startswith("buy:") or data.startswith("sell:"):
@@ -2061,7 +2173,10 @@ async def button_handler(update, context):
             f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
             f"📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 Set TP/SL", callback_data=f"ai_tpsl:{address}")],
+                [InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]
+            ])
         )
 
     elif data.startswith("demo_buy_custom:"):
@@ -2076,6 +2191,27 @@ async def button_handler(update, context):
         await query.answer()
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
         await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
+
+    elif data.startswith("ai_tpsl:"):
+        if not ai_mode_active(user.id):
+            await query.answer("AI Mode is not active.", show_alert=True)
+            return
+        address = data.split(":", 1)[1]
+        pos = find_demo_position(get_demo_positions(user.id), address)
+        if not pos:
+            await query.answer("No open AI Mode position for this token.", show_alert=True)
+            return
+        waiting_for_ai_tpsl[user.id] = {"address": address, "symbol": pos.get("symbol", "TOKEN")}
+        await query.answer()
+        await query.message.reply_text(
+            "🎯 *Set AI Mode Take Profit / Stop Loss*\n\n"
+            "Send two percentages separated by a comma:\n"
+            "`Take Profit %, Stop Loss %`\n\n"
+            "Example: `25, 10` sells automatically at +25% profit or -10% loss.\n"
+            "Use `0` for either setting to disable it, e.g. `25, 0`. Both cannot be 0.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="ai_demo_balance")]])
+        )
 
     elif data.startswith("demo_sell:"):
         parts = data.split(":", 1)
@@ -2406,6 +2542,38 @@ async def handle_message(update, context):
         )
         return
 
+    tpsl_pending = waiting_for_ai_tpsl.get(user.id)
+    if tpsl_pending and ai_mode_active(user.id):
+        parsed = parse_ai_tpsl_input(text)
+        if parsed is None:
+            await update.message.reply_text(
+                "⚠️ Enter TP and SL as two percentages separated by a comma, e.g. `25, 10`. Use 0 to disable one setting; both cannot be 0.",
+                parse_mode="Markdown"
+            )
+            return
+        address = tpsl_pending["address"]
+        positions = get_demo_positions(user.id)
+        pos = find_demo_position(positions, address)
+        if not pos:
+            waiting_for_ai_tpsl.pop(user.id, None)
+            await update.message.reply_text("❌ That AI Mode position is no longer open.")
+            return
+        tp_pct, sl_pct = parsed
+        pos["tp_pct"] = tp_pct
+        pos["sl_pct"] = sl_pct
+        save_demo_positions(user.id, positions)
+        waiting_for_ai_tpsl.pop(user.id, None)
+        symbol = pos.get("symbol", tpsl_pending.get("symbol", "TOKEN"))
+        tp_text = f"+{tp_pct:g}%" if tp_pct else "Off"
+        sl_text = f"-{sl_pct:g}%" if sl_pct else "Off"
+        await notify_admin(context, user, "🎯 AI Mode TP/SL set", f"{symbol} | {pos.get('address')} | TP {tp_text} | SL {sl_text}")
+        await update.message.reply_text(
+            f"✅ *AI Mode TP/SL saved*\n\n🪙 {symbol}\n🎯 Take Profit: {tp_text}\n🛑 Stop Loss: {sl_text}\n\nThe bot will monitor this position automatically while AI Mode is active.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance"), InlineKeyboardButton("🏠 Start", callback_data="home")]])
+        )
+        return
+
     demo_pending = waiting_for_demo_trade.get(user.id)
     if demo_pending and ai_mode_active(user.id):
         amount = parse_demo_amount(text)
@@ -2614,7 +2782,7 @@ if __name__ == "__main__":
     else:
         print("✅ ScraperAPI key configured.")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(start_ai_tpsl_monitor).post_shutdown(stop_ai_tpsl_monitor).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_command))
