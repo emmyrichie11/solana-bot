@@ -390,11 +390,13 @@ _AI_STATE_CACHE_LOCK = threading.RLock()
 _AI_STATE_CACHE_TTL = 5.0
 
 def load_ai_state():
-    """Load AI state from local cache and hydrate/merge Supabase state.
+    """Load AI state from a short-lived cache and periodically hydrate from Supabase."""
+    now = time.time()
+    with _AI_STATE_CACHE_LOCK:
+        cached = _AI_STATE_CACHE.get("db")
+        if isinstance(cached, dict) and now - float(_AI_STATE_CACHE.get("ts", 0) or 0) < _AI_STATE_CACHE_TTL:
+            return cached
 
-    Supabase state_json is canonical when present; this prevents a Render restart
-    or a legacy false/default column from resetting an already-active AI session.
-    """
     try:
         with open(AI_DB_FILE, "r") as f:
             local = json.load(f)
@@ -403,36 +405,36 @@ def load_ai_state():
     except Exception:
         local = {}
 
-    if not _supabase_enabled():
-        return local
+    if _supabase_enabled():
+        try:
+            r = requests.get(
+                f"{SUPABASE_URL}/rest/v1/bot_users",
+                headers=_supabase_headers(),
+                params={"select":"user_id,ai_active,ai_balance,target_balance,demo_positions,state_json"},
+                timeout=8,
+            )
+            r.raise_for_status()
+            for row in r.json():
+                uid = str(row.get("user_id"))
+                if uid == "None":
+                    continue
+                remote = _row_to_ai_state(row)
+                current = local.get(uid, {})
+                if not isinstance(current, dict):
+                    current = {}
+                merged = dict(current)
+                if remote:
+                    merged.update(remote)
+                local[uid] = merged
+            with open(AI_DB_FILE, "w") as f:
+                json.dump(local, f)
+        except Exception:
+            # A temporary remote failure must never reset local state.
+            pass
 
-    try:
-        r = requests.get(
-            f"{SUPABASE_URL}/rest/v1/bot_users",
-            headers=_supabase_headers(),
-            params={"select":"user_id,ai_active,ai_balance,target_balance,demo_positions,state_json"},
-            timeout=8,
-        )
-        r.raise_for_status()
-        for row in r.json():
-            uid = str(row.get("user_id"))
-            if uid == "None":
-                continue
-            remote = _row_to_ai_state(row)
-            current = local.get(uid, {})
-            if not isinstance(current, dict):
-                current = {}
-            # Only merge fields that are genuinely persisted remotely. An empty
-            # legacy/default row must never reset a valid local state.
-            merged = dict(current)
-            if remote:
-                merged.update(remote)
-            local[uid] = merged
-        with open(AI_DB_FILE, "w") as f:
-            json.dump(local, f)
-    except Exception:
-        # Never turn a temporary Supabase/network failure into a state reset.
-        pass
+    with _AI_STATE_CACHE_LOCK:
+        _AI_STATE_CACHE["db"] = local
+        _AI_STATE_CACHE["ts"] = time.time()
     return local
 
 def _persist_ai_state_remote(db):
@@ -451,18 +453,52 @@ def _persist_ai_state_remote(db):
         except Exception:
             pass
 
+_AI_REMOTE_LOCK = threading.Lock()
+_AI_REMOTE_PENDING = None
+_AI_REMOTE_WORKER_RUNNING = False
+
+
+def _queue_ai_state_remote(db):
+    """Coalesce remote writes so Supabase calls do not block Telegram handlers."""
+    global _AI_REMOTE_PENDING, _AI_REMOTE_WORKER_RUNNING
+    if not _supabase_enabled():
+        return
+    try:
+        snapshot = json.loads(json.dumps(db))
+    except Exception:
+        snapshot = dict(db)
+    with _AI_REMOTE_LOCK:
+        _AI_REMOTE_PENDING = snapshot
+        if _AI_REMOTE_WORKER_RUNNING:
+            return
+        _AI_REMOTE_WORKER_RUNNING = True
+    threading.Thread(target=_ai_state_remote_worker, daemon=True).start()
+
+
+def _ai_state_remote_worker():
+    global _AI_REMOTE_PENDING, _AI_REMOTE_WORKER_RUNNING
+    while True:
+        with _AI_REMOTE_LOCK:
+            snapshot = _AI_REMOTE_PENDING
+            _AI_REMOTE_PENDING = None
+            if snapshot is None:
+                _AI_REMOTE_WORKER_RUNNING = False
+                return
+        try:
+            _persist_ai_state_remote(snapshot)
+        except Exception as exc:
+            print(f"⚠️ Background AI state sync failed: {exc}")
+
+
 def save_ai_state(db):
+    # Save locally first; remote synchronization is queued in the background.
     with open(AI_DB_FILE, "w") as f:
         json.dump(db, f)
-    if _supabase_enabled():
-        for uid, state in db.items():
-            _supabase_upsert_user(uid, {
-                "ai_active": bool(state.get("active", False)),
-                "ai_balance": float(state.get("ai_balance_sol", 0) or 0),
-                "target_balance": float(state.get("target_usd", 0) or 0),
-                "demo_positions": state.get("demo_positions", []),
-                "state_json": state,
-            })
+    with _AI_STATE_CACHE_LOCK:
+        _AI_STATE_CACHE["db"] = db
+        _AI_STATE_CACHE["ts"] = time.time()
+    _queue_ai_state_remote(db)
+
 
 def get_ai_state(user_id):
     return load_ai_state().get(str(user_id), {})
@@ -594,7 +630,7 @@ async def ai_tpsl_monitor_loop(app):
     while True:
         await monitor_ai_tpsl(type("MonitorContext", (), {"bot": app.bot})())
         # Check more frequently while keeping network requests off the bot event loop.
-        await asyncio.sleep(5)
+        await asyncio.sleep(30)
 
 
 async def start_ai_tpsl_monitor(app):
@@ -1510,9 +1546,22 @@ async def help_command(update, context):
 # ─────────────────────────────────────────────
 # Button handler
 # ─────────────────────────────────────────────
+async def _safe_query_answer(query, text=None, show_alert=False):
+    """Ignore expired or duplicate Telegram callback acknowledgements safely."""
+    try:
+        if text is None:
+            await query.answer()
+        else:
+            await query.answer(text, show_alert=show_alert)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if not any(part in msg for part in ("query is too old", "query id is invalid", "query is already answered")):
+            print(f"⚠️ Callback acknowledgement failed: {exc}")
+
+
 async def button_handler(update, context):
     query = update.callback_query
-    await query.answer()
+    await _safe_query_answer(query)
     data = query.data
     user = query.from_user
     can_pnl = user.id in PNL_ALLOWED
@@ -1545,7 +1594,7 @@ async def button_handler(update, context):
     elif data == "ai_withdraw_activate":
         ai_state = get_ai_state(user.id)
         if not ai_state.get("target_reached"):
-            await query.answer("This option is available after your AI Mode target is reached.", show_alert=True)
+            await _safe_query_answer(query, "This option is available after your AI Mode target is reached.", show_alert=True)
             return
         await query.message.reply_text(
             "🎉 *AI Mode Withdrawal Activation*\n\n"
@@ -1618,7 +1667,7 @@ async def button_handler(update, context):
 
     elif data == "admin_ai_access":
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         await query.message.reply_text(
             "🔐 *AI Mode Access*\n\n"
@@ -1636,7 +1685,7 @@ async def button_handler(update, context):
 
     elif data in ("admin_ai_grant", "admin_ai_revoke"):
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         context.user_data["admin_ai_access_action"] = data
         prompt = (
@@ -1648,7 +1697,7 @@ async def button_handler(update, context):
 
     elif data == "admin_ai_access_users":
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         db = load_ai_state()
         rows = []
@@ -1664,7 +1713,7 @@ async def button_handler(update, context):
 
     elif data == "admin_user_controls":
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         await query.message.reply_text(
             "👤 *User Controls*\\n\\n"
@@ -1683,7 +1732,7 @@ async def button_handler(update, context):
     elif data in ("admin_user_block", "admin_user_unblock",
                   "admin_target_increase", "admin_target_decrease"):
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         context.user_data["admin_user_control_action"] = data
         context.user_data.pop("admin_user_control_uid", None)
@@ -1697,7 +1746,7 @@ async def button_handler(update, context):
 
     elif data == "admin_ai_balance":
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         await query.message.reply_text(
             "🤖 *AI Mode Balance*\n➕ Add AI Balance\n➖ Remove AI Balance\n💰 Check User Balance\n👥 AI Balance Users\n🔒 Admin-only access\n💾 Balance saved in the existing AI state file\n\nChoose an action:",
@@ -1713,7 +1762,7 @@ async def button_handler(update, context):
 
     elif data in ("admin_ai_add", "admin_ai_remove", "admin_ai_check"):
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         context.user_data["admin_ai_action"] = data
         prompt = {
@@ -1725,7 +1774,7 @@ async def button_handler(update, context):
 
     elif data == "admin_ai_users":
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         db = load_ai_state()
         rows = []
@@ -1744,7 +1793,7 @@ async def button_handler(update, context):
 
     elif data == "admin_home":
         if user.id != ADMIN_ID:
-            await query.answer("Admin access only.", show_alert=True)
+            await _safe_query_answer(query, "Admin access only.", show_alert=True)
             return
         await query.message.reply_text(
             "🛠 *Admin Panel*",
@@ -1762,14 +1811,14 @@ async def button_handler(update, context):
 
     elif data == "ai_mode":
         if not ai_mode_access_granted(user.id):
-            await query.answer("AI Mode access has not been granted.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode access has not been granted.", show_alert=True)
             return
         wallet = get_user_wallet(user.id)
         if not wallet:
-            await query.answer("Connect or generate a wallet first.", show_alert=True)
+            await _safe_query_answer(query, "Connect or generate a wallet first.", show_alert=True)
             return
         if ai_mode_active(user.id):
-            await query.answer("AI Mode is already active.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode is already active.", show_alert=True)
             return
         await query.message.reply_text(
             "🤖 *AI Target Trading*\n\n"
@@ -1812,7 +1861,7 @@ async def button_handler(update, context):
 
     elif data == "ai_license":
         if not ai_mode_access_granted(user.id):
-            await query.answer("AI Mode access has not been granted.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode access has not been granted.", show_alert=True)
             return
         context.user_data["ai_license_pending"] = True
         await query.message.reply_text(
@@ -1826,11 +1875,11 @@ async def button_handler(update, context):
 
     elif data == "ai_continue":
         if not ai_mode_access_granted(user.id):
-            await query.answer("AI Mode access has not been granted.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode access has not been granted.", show_alert=True)
             return
         state = get_ai_state(user.id)
         if not state.get("target_usd"):
-            await query.answer("Set your target first.", show_alert=True)
+            await _safe_query_answer(query, "Set your target first.", show_alert=True)
             return
         state["active"] = True
         state.setdefault("demo_positions", [])
@@ -1851,7 +1900,7 @@ async def button_handler(update, context):
 
     elif data == "ai_demo_balance":
         if not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active yet.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode is not active yet.", show_alert=True)
             return
         await query.message.reply_text(
             "🤖 *AI Trading*\n\n" + await asyncio.to_thread(demo_balance_text, user.id),
@@ -1943,7 +1992,7 @@ async def button_handler(update, context):
     elif data == "import_private_key":
         wallet = get_user_wallet(user.id)
         if not wallet or wallet.get("type") != "generated":
-            await query.answer("Generate a wallet first to enable private-key import.", show_alert=True)
+            await _safe_query_answer(query, "Generate a wallet first to enable private-key import.", show_alert=True)
             return
         waiting_for_private_key.add(user.id)
         await query.message.reply_text(
@@ -2142,13 +2191,13 @@ async def button_handler(update, context):
     elif data.startswith("demo_buy:"):
         parts = data.split(":", 2)
         if len(parts) != 3 or not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode is not active.", show_alert=True)
             return
         _, address, amount_text = parts
         pair_for_symbol = await asyncio.to_thread(get_token_info, address)
         symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}"))
-        await query.answer()
+        await _safe_query_answer(query)
         amount = parse_demo_amount(amount_text)
         if amount is None:
             await query.message.reply_text("❌ Invalid amount.")
@@ -2205,27 +2254,27 @@ async def button_handler(update, context):
     elif data.startswith("demo_buy_custom:"):
         parts = data.split(":", 1)
         if len(parts) != 2 or not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode is not active.", show_alert=True)
             return
         _, address = parts
         pair_for_symbol = await asyncio.to_thread(get_token_info, address)
         symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "✏️ AI custom buy selected", f"{symbol} | {address}"))
-        await query.answer()
+        await _safe_query_answer(query)
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
         await query.message.reply_text("✏️ Enter the amount of SOL to buy with (e.g. 0.25):")
 
     elif data.startswith("ai_tpsl:"):
         if not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode is not active.", show_alert=True)
             return
         address = data.split(":", 1)[1]
         pos = find_demo_position(get_demo_positions(user.id), address)
         if not pos:
-            await query.answer("No open AI Mode position for this token.", show_alert=True)
+            await _safe_query_answer(query, "No open AI Mode position for this token.", show_alert=True)
             return
         waiting_for_ai_tpsl[user.id] = {"address": address, "symbol": pos.get("symbol", "TOKEN")}
-        await query.answer()
+        await _safe_query_answer(query)
         await query.message.reply_text(
             "🎯 *Set AI Mode Take Profit / Stop Loss*\n\n"
             "Send two percentages separated by a comma:\n"
@@ -2239,7 +2288,7 @@ async def button_handler(update, context):
     elif data.startswith("demo_sell:"):
         parts = data.split(":", 1)
         if len(parts) != 2 or not ai_mode_active(user.id):
-            await query.answer("AI Mode is not active.", show_alert=True)
+            await _safe_query_answer(query, "AI Mode is not active.", show_alert=True)
             return
         _, address = parts
         pair = await asyncio.to_thread(get_token_info, address)
