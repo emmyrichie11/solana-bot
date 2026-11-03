@@ -424,7 +424,13 @@ def load_ai_state():
                     current = {}
                 merged = dict(current)
                 if remote:
+                    # The local JSON file is written immediately, while Supabase
+                    # updates are queued in the background. Never let an older
+                    # remote snapshot erase a locally saved open AI position.
+                    local_positions = current.get("demo_positions") if isinstance(current, dict) else None
                     merged.update(remote)
+                    if isinstance(local_positions, list):
+                        merged["demo_positions"] = local_positions
                 local[uid] = merged
             with open(AI_DB_FILE, "w") as f:
                 json.dump(local, f)
@@ -764,8 +770,9 @@ def parse_demo_amount(text):
         return None
 
 def find_demo_position(positions, address):
+    target = str(address or "").strip()
     for pos in positions:
-        if pos.get("address") == address:
+        if str(pos.get("address") or "").strip() == target:
             return pos
     return None
 
@@ -2140,25 +2147,24 @@ async def button_handler(update, context):
 
     elif data.startswith("buy:") or data.startswith("sell:"):
         action, address = data.split(":", 1)
-        await query.message.reply_text("⏳ Opening trade... fetching the current token price.")
-        pair = await asyncio.to_thread(get_token_info, address)
-        if not pair:
-            asyncio.create_task(notify_admin(context, user, f"❌ {action.upper()} token lookup failed", address))
-            await query.message.reply_text("❌ Could not fetch current token data.")
-            return
-        symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
-        asyncio.create_task(notify_admin(context, user, f"🔘 {action.upper()} button pressed", f"{symbol} | {address}"))
-        if ai_mode_active(user.id):
-            price = float(pair.get("priceUsd", 0) or 0)
-            if price <= 0:
-                asyncio.create_task(notify_admin(context, user, f"❌ {action.upper()} unavailable", f"{symbol} | no current price"))
-                await query.message.reply_text("❌ Current token price is unavailable.")
-                return
-            if action == "buy":
-                await query.message.reply_text(
-                    f"🤖 *Buy — {symbol}*\n\n"
-                    f"{await asyncio.to_thread(demo_balance_text, user.id)}\n\n"
-                    "Choose how much SOL to use:",
+        if ai_mode_active(user.id) and action == "buy":
+            # Opening the amount menu should not wait for market-data APIs or
+            # reprice every other open position. The selected amount handler
+            # fetches the token price once, when it is actually needed.
+            positions = get_demo_positions(user.id)
+            existing_pos = find_demo_position(positions, address)
+            symbol = existing_pos.get("symbol", "TOKEN") if existing_pos else "TOKEN"
+            asyncio.create_task(notify_admin(context, user, "🔘 BUY button pressed", f"{symbol} | {address}"))
+            state = get_ai_state(user.id)
+            balance = get_ai_balance(user.id)
+            target = float(state.get("target_usd", 0) or 0)
+            await _safe_query_answer(query)
+            await query.message.reply_text(
+                f"🤖 *Buy — {symbol}*\n\n"
+                f"💰 *Balance:* {balance:.4f} SOL\n"
+                f"🎯 *Target:* ${target:,.2f}\n"
+                f"📦 *Open Positions:* {len(positions)}\n\n"
+                "Choose how much SOL to use:",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("0.1 SOL", callback_data=f"demo_buy:{address}:0.1"),
@@ -2169,7 +2175,23 @@ async def button_handler(update, context):
                          InlineKeyboardButton("❌ Cancel", callback_data="home")]
                     ])
                 )
-            else:
+        else:
+            # Sell still needs a fresh price, but answer the Telegram callback
+            # immediately so the button does not appear to hang.
+            await _safe_query_answer(query)
+            pair = await asyncio.to_thread(get_token_info, address)
+            if not pair:
+                asyncio.create_task(notify_admin(context, user, f"❌ {action.upper()} token lookup failed", address))
+                await query.message.reply_text("❌ Could not fetch current token data.")
+                return
+            symbol = pair.get("baseToken", {}).get("symbol", "TOKEN")
+            asyncio.create_task(notify_admin(context, user, f"🔘 {action.upper()} button pressed", f"{symbol} | {address}"))
+            if ai_mode_active(user.id):
+                price = float(pair.get("priceUsd", 0) or 0)
+                if price <= 0:
+                    asyncio.create_task(notify_admin(context, user, f"❌ {action.upper()} unavailable", f"{symbol} | no current price"))
+                    await query.message.reply_text("❌ Current token price is unavailable.")
+                    return
                 positions = get_demo_positions(user.id)
                 pos = find_demo_position(positions, address)
                 if not pos:
@@ -2186,10 +2208,10 @@ async def button_handler(update, context):
                         [InlineKeyboardButton("❌ Cancel", callback_data="home")]
                     ])
                 )
-        else:
-            await query.message.reply_text(
-                f"{'🟢' if action == 'buy' else '🔴'} *{symbol}*\n\n⚠️ Connect your wallet first.",
-                parse_mode="Markdown")
+            else:
+                await query.message.reply_text(
+                    f"{'🟢' if action == 'buy' else '🔴'} *{symbol}*\n\n⚠️ Connect your wallet first.",
+                    parse_mode="Markdown")
 
     elif data.startswith("demo_buy:"):
         parts = data.split(":", 2)
@@ -2197,24 +2219,26 @@ async def button_handler(update, context):
             await _safe_query_answer(query, "AI Mode is not active.", show_alert=True)
             return
         _, address, amount_text = parts
-        pair_for_symbol = await asyncio.to_thread(get_token_info, address)
-        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
-        asyncio.create_task(notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}"))
         await _safe_query_answer(query)
         amount = parse_demo_amount(amount_text)
         if amount is None:
             await query.message.reply_text("❌ Invalid amount.")
             return
         balance = get_ai_balance(user.id)
+        existing_position = find_demo_position(get_demo_positions(user.id), address)
+        symbol = existing_position.get("symbol", "TOKEN") if existing_position else "TOKEN"
         if amount > balance:
             asyncio.create_task(notify_admin(context, user, "❌ AI buy rejected", f"{symbol} | insufficient balance {balance:.4f} SOL"))
             await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
+        await query.message.reply_text("⏳ Processing your AI Mode buy...")
         pair = await asyncio.to_thread(get_token_info, address)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         if price <= 0:
             await query.message.reply_text("❌ Current token price is unavailable.")
             return
+        symbol = (pair or {}).get("baseToken", {}).get("symbol", "TOKEN")
+        asyncio.create_task(notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}"))
         positions = get_demo_positions(user.id)
         pos = find_demo_position(positions, address)
         tokens = amount / price
@@ -2260,8 +2284,8 @@ async def button_handler(update, context):
             await _safe_query_answer(query, "AI Mode is not active.", show_alert=True)
             return
         _, address = parts
-        pair_for_symbol = await asyncio.to_thread(get_token_info, address)
-        symbol = (pair_for_symbol or {}).get("baseToken", {}).get("symbol", "TOKEN")
+        existing_position = find_demo_position(get_demo_positions(user.id), address)
+        symbol = existing_position.get("symbol", "TOKEN") if existing_position else "TOKEN"
         asyncio.create_task(notify_admin(context, user, "✏️ AI custom buy selected", f"{symbol} | {address}"))
         await _safe_query_answer(query)
         waiting_for_demo_trade[user.id] = {"action": "buy", "address": address, "symbol": symbol}
