@@ -2201,10 +2201,12 @@ async def button_handler(update, context):
                     f"🔴 *Sell — {symbol}*\n\n"
                     f"Current price: ${price:.10f}\n"
                     f"Position: {float(pos.get('amount_sol', 0)):.4f} SOL invested\n\n"
-                    "Sell the full position?",
+                    "Choose how much of this position to sell:",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔴 Sell All", callback_data=f"demo_sell:{address}")],
+                        [InlineKeyboardButton("Sell 50%", callback_data=f"demo_sell:{address}:50"),
+                         InlineKeyboardButton("Sell 75%", callback_data=f"demo_sell:{address}:75")],
+                        [InlineKeyboardButton("Sell 100%", callback_data=f"demo_sell:{address}:100")],
                         [InlineKeyboardButton("❌ Cancel", callback_data="home")]
                     ])
                 )
@@ -2313,11 +2315,20 @@ async def button_handler(update, context):
         )
 
     elif data.startswith("demo_sell:"):
-        parts = data.split(":", 1)
-        if len(parts) != 2 or not ai_mode_active(user.id):
+        parts = data.split(":", 2)
+        if len(parts) not in (2, 3) or not ai_mode_active(user.id):
             await _safe_query_answer(query, "AI Mode is not active.", show_alert=True)
             return
-        _, address = parts
+        address = parts[1]
+        try:
+            sell_pct = float(parts[2]) if len(parts) == 3 else 100.0
+        except (TypeError, ValueError):
+            await _safe_query_answer(query, "Invalid sell percentage.", show_alert=True)
+            return
+        if sell_pct not in (50.0, 75.0, 100.0):
+            await _safe_query_answer(query, "Invalid sell percentage.", show_alert=True)
+            return
+        await _safe_query_answer(query)
         pair = await asyncio.to_thread(get_token_info, address)
         symbol = (pair or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}"))
@@ -2327,15 +2338,23 @@ async def button_handler(update, context):
         if not pos or price <= 0:
             await query.message.reply_text("❌ Position or current price unavailable.")
             return
-        tokens = float(pos.get("tokens", 0))
-        invested = float(pos.get("amount_sol", 0))
+        sell_fraction = sell_pct / 100.0
+        tokens = float(pos.get("tokens", 0)) * sell_fraction
+        invested = float(pos.get("amount_sol", 0)) * sell_fraction
         entry = float(pos.get("entry_price", 0))
         value = tokens * price
         pnl = value - invested
+        sold_pos = dict(pos)
+        sold_pos["tokens"] = tokens
+        sold_pos["amount_sol"] = invested
         set_ai_balance(user.id, get_ai_balance(user.id) + value)
-        positions = [p for p in positions if p.get("address") != address]
+        if sell_pct >= 100.0:
+            positions = [p for p in positions if p.get("address") != address]
+        else:
+            pos["tokens"] = float(pos.get("tokens", 0)) - tokens
+            pos["amount_sol"] = float(pos.get("amount_sol", 0)) - invested
         save_demo_positions(user.id, positions)
-        asyncio.create_task(notify_admin(context, user, "🤖 AI sell", f"{symbol} | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL"))
+        asyncio.create_task(notify_admin(context, user, "🤖 AI sell", f"{symbol} | Sold {sell_pct:g}% | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL"))
 
         # Check whether the user's AI Mode balance has reached their USD target.
         ai_state = get_ai_state(user.id)
@@ -2357,14 +2376,14 @@ async def button_handler(update, context):
             )
         else:
             await query.message.reply_text(
-                f"✅ *Sell Successful*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
+                f"✅ *Sell Successful ({sell_pct:g}%)*\n\n🪙 {symbol}\n💰 Received: {value:.4f} SOL\n"
                 f"📊 PnL: {pnl:+.4f} SOL\n📈 Entry: ${entry:.10f}\n💵 Exit: ${price:.10f}\n"
                 f"💰 Balance: {get_ai_balance(user.id):.4f} SOL",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]])
             )
         # Closed-trade PnL card: uses the same artwork/template as the main PnL card.
-        await send_closed_pnl_card(context, user, query.message, pos, pair, price, value, pnl)
+        await send_closed_pnl_card(context, user, query.message, sold_pos, pair, price, value, pnl)
 
     elif data.startswith("refresh:"):
         address = data.split(":")[1]
@@ -2707,7 +2726,15 @@ async def handle_message(update, context):
         set_ai_balance(user.id, balance - amount)
         save_demo_positions(user.id, positions)
         await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
-        await update.message.reply_text(f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
+            f"📈 Entry Price: ${price:.10f}\n💰 Remaining Balance: {get_ai_balance(user.id):.4f} SOL",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎯 Set TP/SL", callback_data=f"ai_tpsl:{address}")],
+                [InlineKeyboardButton("🏠 Start", callback_data="home"), InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance")]
+            ])
+        )
         return
 
     pnl_state = waiting_for_pnl.get(user.id)
