@@ -585,7 +585,7 @@ async def monitor_ai_tpsl(context):
                         continue
                     # Price lookups use synchronous HTTP internally; run them in a
                     # worker thread so a slow market-data API does not freeze Telegram replies.
-                    pair = await asyncio.to_thread(get_token_info, address)
+                    pair = await asyncio.to_thread(get_ai_position_market_data, address, pos)
                     price = float(pair.get("priceUsd") or 0) if pair else 0
                     if price <= 0:
                         continue
@@ -605,6 +605,11 @@ async def monitor_ai_tpsl(context):
                         latest_pos = find_demo_position(latest_positions, address)
                         if not latest_pos:
                             continue
+                        if not latest_pos.get("pair_address") and pair.get("pairAddress"):
+                            latest_pos["pair_address"] = pair.get("pairAddress")
+                            latest_pos["dex_id"] = pair.get("dexId")
+                            latest_state["demo_positions"] = latest_positions
+                            save_ai_state_for_user(uid, latest_state)
                         latest_tokens = float(latest_pos.get("tokens") or 0)
                         latest_invested = float(latest_pos.get("amount_sol") or 0)
                         latest_entry = float(latest_pos.get("entry_price") or 0)
@@ -666,7 +671,7 @@ async def ai_tpsl_monitor_loop(app):
     while True:
         await monitor_ai_tpsl(type("MonitorContext", (), {"bot": app.bot})())
         # Check more frequently while keeping network requests off the bot event loop.
-        await asyncio.sleep(30)
+        await asyncio.sleep(15)
 
 
 async def start_ai_tpsl_monitor(app):
@@ -754,7 +759,7 @@ def demo_balance_text(user_id):
         tokens = float(pos.get("tokens", 0) or 0)
         entry = float(pos.get("entry_price", 0) or 0)
 
-        pair = get_token_info(address) if address else None
+        pair = get_ai_position_market_data(address, pos) if address else None
         current_price = float(pair.get("priceUsd", 0) or 0) if pair else 0.0
 
         if current_price > 0 and tokens > 0:
@@ -1216,6 +1221,75 @@ def _get_token_info_cached(address, cache_bucket):
 def get_token_info(address):
     """Return cached token data briefly to reduce repeated API waits on buttons."""
     return _get_token_info_cached(str(address or "").strip(), int(time.time() // 8))
+
+# AI Mode uses one canonical DexScreener pool per position so the balance
+# screen, manual sells and TP/SL monitor cannot switch between different pools
+# or fallback-provider prices for the same mint.
+_AI_POSITION_PRICE_CACHE = {}
+_AI_POSITION_PRICE_CACHE_LOCK = threading.Lock()
+
+
+def get_ai_position_market_data(address, position=None):
+    """Fetch AI Mode prices from the exact Solana pool assigned to a position.
+
+    Older positions without a saved pair address are assigned the deepest
+    DexScreener Solana pool whose base token is exactly the requested mint.
+    AI PnL and TP/SL do not mix prices from GeckoTerminal/CoinGecko/Pump.fun.
+    """
+    mint = str(address or "").strip()
+    if not mint:
+        return None
+
+    stored_pair = str((position or {}).get("pair_address") or "").strip()
+    cache_key = ("pair", stored_pair.lower()) if stored_pair else ("mint", mint.lower())
+    now = time.time()
+    with _AI_POSITION_PRICE_CACHE_LOCK:
+        cached = _AI_POSITION_PRICE_CACHE.get(cache_key)
+        if cached and now - cached[0] < 3.0:
+            return dict(cached[1])
+
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    try:
+        if stored_pair:
+            url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{stored_pair}"
+        else:
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+        response = requests.get(url, headers=headers, timeout=8)
+        response.raise_for_status()
+        pairs = response.json().get("pairs") or []
+        valid = []
+        for candidate in pairs:
+            try:
+                if str(candidate.get("chainId") or "").lower() != "solana":
+                    continue
+                base_address = str((candidate.get("baseToken") or {}).get("address") or "")
+                if base_address.lower() != mint.lower():
+                    continue
+                pair_address = str(candidate.get("pairAddress") or "")
+                if stored_pair and pair_address.lower() != stored_pair.lower():
+                    continue
+                price = float(candidate.get("priceUsd") or 0)
+                if price <= 0 or not pair_address:
+                    continue
+                liquidity = float((candidate.get("liquidity") or {}).get("usd") or 0)
+                valid.append((liquidity, candidate))
+            except (TypeError, ValueError):
+                continue
+
+        if not valid:
+            return None
+        valid.sort(key=lambda item: item[0], reverse=True)
+        pair = dict(valid[0][1])
+        with _AI_POSITION_PRICE_CACHE_LOCK:
+            _AI_POSITION_PRICE_CACHE[cache_key] = (now, dict(pair))
+            if len(_AI_POSITION_PRICE_CACHE) > 512:
+                oldest = sorted(_AI_POSITION_PRICE_CACHE.items(), key=lambda item: item[1][0])[:128]
+                for key, _ in oldest:
+                    _AI_POSITION_PRICE_CACHE.pop(key, None)
+        return pair
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+
 
 def _get_token_info_uncached(address):
     """Fetch token price info - tries multiple APIs"""
@@ -2264,7 +2338,7 @@ async def button_handler(update, context):
             await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
         await query.message.reply_text("⏳ Processing your AI Mode buy...")
-        pair = await asyncio.to_thread(get_token_info, address)
+        pair = await asyncio.to_thread(get_ai_position_market_data, address, existing_position)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         if price <= 0:
             await query.message.reply_text("❌ Current token price is unavailable.")
@@ -2295,6 +2369,8 @@ async def button_handler(update, context):
                     elif current_entry_mcap > 0:
                         pos["entry_mcap"] = current_entry_mcap
                     pos["symbol"] = symbol
+                    pos.setdefault("pair_address", pair.get("pairAddress"))
+                    pos.setdefault("dex_id", pair.get("dexId"))
                 else:
                     positions.append({
                         "address": address, "symbol": symbol,
@@ -2302,7 +2378,9 @@ async def button_handler(update, context):
                         "logo_url": (pair.get("info") or {}).get("imageUrl"),
                         "tokens": tokens, "amount_sol": amount,
                         "entry_price": price,
-                        "entry_mcap": float(pair.get("marketCap", 0) or 0)
+                        "entry_mcap": float(pair.get("marketCap", 0) or 0),
+                        "pair_address": pair.get("pairAddress"),
+                        "dex_id": pair.get("dexId")
                     })
                 trade_state["ai_balance_sol"] = max(0.0, balance - amount)
                 trade_state["demo_positions"] = positions
@@ -2370,7 +2448,8 @@ async def button_handler(update, context):
             await _safe_query_answer(query, "Invalid sell percentage.", show_alert=True)
             return
         await _safe_query_answer(query)
-        pair = await asyncio.to_thread(get_token_info, address)
+        position_for_price = find_demo_position(get_demo_positions(user.id), address)
+        pair = await asyncio.to_thread(get_ai_position_market_data, address, position_for_price)
         symbol = (pair or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}"))
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
@@ -2755,7 +2834,8 @@ async def handle_message(update, context):
         waiting_for_demo_trade.pop(user.id, None)
         address = demo_pending["address"]
         symbol = demo_pending["symbol"]
-        pair = await asyncio.to_thread(get_token_info, address)
+        existing_position = find_demo_position(get_demo_positions(user.id), address)
+        pair = await asyncio.to_thread(get_ai_position_market_data, address, existing_position)
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
         balance = get_ai_balance(user.id)
         if price <= 0:
@@ -2781,8 +2861,10 @@ async def handle_message(update, context):
                     pos["tokens"] = old_tokens + tokens
                     pos["amount_sol"] = total_amount
                     pos["entry_price"] = total_amount / pos["tokens"]
+                    pos.setdefault("pair_address", pair.get("pairAddress"))
+                    pos.setdefault("dex_id", pair.get("dexId"))
                 else:
-                    positions.append({"address": address, "symbol": symbol, "name": pair.get("baseToken", {}).get("name", symbol), "logo_url": (pair.get("info") or {}).get("imageUrl"), "tokens": tokens, "amount_sol": amount, "entry_price": price})
+                    positions.append({"address": address, "symbol": symbol, "name": pair.get("baseToken", {}).get("name", symbol), "logo_url": (pair.get("info") or {}).get("imageUrl"), "tokens": tokens, "amount_sol": amount, "entry_price": price, "pair_address": pair.get("pairAddress"), "dex_id": pair.get("dexId")})
                 trade_state["ai_balance_sol"] = max(0.0, balance - amount)
                 trade_state["demo_positions"] = positions
                 save_ai_state_for_user(user.id, trade_state)
