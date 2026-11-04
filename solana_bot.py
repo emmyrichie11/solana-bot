@@ -387,6 +387,7 @@ def _row_to_ai_state(row):
 
 _AI_STATE_CACHE = {"db": None, "ts": 0.0}
 _AI_STATE_CACHE_LOCK = threading.RLock()
+_AI_TRADE_LOCK = threading.RLock()
 _AI_STATE_CACHE_TTL = 5.0
 
 def load_ai_state():
@@ -428,9 +429,14 @@ def load_ai_state():
                     # updates are queued in the background. Never let an older
                     # remote snapshot erase a locally saved open AI position.
                     local_positions = current.get("demo_positions") if isinstance(current, dict) else None
+                    local_balance = current.get("ai_balance_sol") if isinstance(current, dict) else None
                     merged.update(remote)
                     if isinstance(local_positions, list):
                         merged["demo_positions"] = local_positions
+                    # Local AI balance is written synchronously; an older remote
+                    # snapshot must never restore a pre-trade balance.
+                    if local_balance is not None:
+                        merged["ai_balance_sol"] = local_balance
                 local[uid] = merged
             with open(AI_DB_FILE, "w") as f:
                 json.dump(local, f)
@@ -590,22 +596,48 @@ async def monitor_ai_tpsl(context):
                         reason = "STOP LOSS"
                     if not reason:
                         continue
-                    value = tokens * price
-                    pnl = value - invested
-                    # Remove first and persist before notifying, avoiding duplicate sells
-                    # if a notification or price request fails during this iteration.
-                    positions[:] = [p for p in positions if p is not pos]
-                    state["demo_positions"] = positions
-                    state["ai_balance_sol"] = max(0.0, float(state.get("ai_balance_sol", 0) or 0) + value)
-                    save_ai_state_for_user(uid, state)
+                    # The price lookup above can take several seconds. Re-read the
+                    # latest state under the trade lock before settling so a stale
+                    # monitor snapshot cannot restore the pre-buy balance or position.
+                    with _AI_TRADE_LOCK:
+                        latest_state = get_ai_state(uid)
+                        latest_positions = latest_state.get("demo_positions", [])
+                        latest_pos = find_demo_position(latest_positions, address)
+                        if not latest_pos:
+                            continue
+                        latest_tokens = float(latest_pos.get("tokens") or 0)
+                        latest_invested = float(latest_pos.get("amount_sol") or 0)
+                        latest_entry = float(latest_pos.get("entry_price") or 0)
+                        latest_tp = float(latest_pos.get("tp_pct") or 0)
+                        latest_sl = float(latest_pos.get("sl_pct") or 0)
+                        if latest_tokens <= 0 or latest_entry <= 0:
+                            continue
+                        latest_reason = None
+                        if latest_tp > 0 and price >= latest_entry * (1 + latest_tp / 100.0):
+                            latest_reason = "TAKE PROFIT"
+                        elif latest_sl > 0 and price <= latest_entry * (1 - latest_sl / 100.0):
+                            latest_reason = "STOP LOSS"
+                        if not latest_reason:
+                            continue
+                        reason = latest_reason
+                        value = latest_tokens * price
+                        pnl = value - latest_invested
+                        latest_state["demo_positions"] = [
+                            p for p in latest_positions if p is not latest_pos
+                        ]
+                        latest_state["ai_balance_sol"] = max(
+                            0.0, float(latest_state.get("ai_balance_sol", 0) or 0) + value
+                        )
+                        save_ai_state_for_user(uid, latest_state)
+                        settled_balance = float(latest_state["ai_balance_sol"])
                     changed = True
-                    symbol = pos.get("symbol", "TOKEN")
+                    symbol = latest_pos.get("symbol", "TOKEN")
                     try:
                         await context.bot.send_message(
                             chat_id=int(uid),
                             text=(f"🤖 *AI Mode {reason} triggered*\n\n🪙 {symbol}\n"
                                   f"💵 Exit price: ${price:.10f}\n💰 Received: {value:.4f} SOL\n"
-                                  f"📊 PnL: {pnl:+.4f} SOL\n💰 Balance: {float(state.get('ai_balance_sol', 0)):.4f} SOL"),
+                                  f"📊 PnL: {pnl:+.4f} SOL\n💰 Balance: {settled_balance:.4f} SOL"),
                             parse_mode="Markdown",
                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💰 Balance", callback_data="ai_demo_balance"), InlineKeyboardButton("🏠 Start", callback_data="home")]])
                         )
@@ -622,10 +654,8 @@ async def monitor_ai_tpsl(context):
                         pass
                 except Exception:
                     continue
-            if changed:
-                # Keep the user's remaining positions persisted after processing.
-                state["demo_positions"] = positions
-                save_ai_state_for_user(uid, state)
+            # Each triggered position is persisted immediately from the latest
+            # state inside _AI_TRADE_LOCK; do not save this older loop snapshot.
     except Exception:
         # Monitoring must not stop the bot if a data source is temporarily unavailable.
         pass
@@ -2241,34 +2271,45 @@ async def button_handler(update, context):
             return
         symbol = (pair or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "🟢 AI buy amount selected", f"{symbol} | {amount_text} SOL | {address}"))
-        positions = get_demo_positions(user.id)
-        pos = find_demo_position(positions, address)
         tokens = amount / price
-        if pos:
-            old_amount = float(pos.get("amount_sol", 0))
-            old_tokens = float(pos.get("tokens", 0))
-            total_amount = old_amount + amount
-            pos["tokens"] = old_tokens + tokens
-            pos["amount_sol"] = total_amount
-            pos["entry_price"] = total_amount / pos["tokens"]
-            old_entry_mcap = _position_entry_mcap(pos, float(pair.get("marketCap", 0) or 0), price)
-            current_entry_mcap = float(pair.get("marketCap", 0) or 0)
-            if old_entry_mcap > 0 and current_entry_mcap > 0:
-                pos["entry_mcap"] = ((old_entry_mcap * old_amount) + (current_entry_mcap * amount)) / total_amount
-            elif current_entry_mcap > 0:
-                pos["entry_mcap"] = current_entry_mcap
-            pos["symbol"] = symbol
-        else:
-            positions.append({
-                "address": address, "symbol": symbol,
-                "name": pair.get("baseToken", {}).get("name", symbol),
-                "logo_url": (pair.get("info") or {}).get("imageUrl"),
-                "tokens": tokens, "amount_sol": amount,
-                "entry_price": price,
-                "entry_mcap": float(pair.get("marketCap", 0) or 0)
-            })
-        set_ai_balance(user.id, balance - amount)
-        save_demo_positions(user.id, positions)
+        with _AI_TRADE_LOCK:
+            trade_state = get_ai_state(user.id)
+            balance = float(trade_state.get("ai_balance_sol", 0) or 0)
+            insufficient_balance = amount > balance
+            positions = trade_state.get("demo_positions", [])
+            if not isinstance(positions, list):
+                positions = []
+            pos = find_demo_position(positions, address)
+            if not insufficient_balance:
+                if pos:
+                    old_amount = float(pos.get("amount_sol", 0))
+                    old_tokens = float(pos.get("tokens", 0))
+                    total_amount = old_amount + amount
+                    pos["tokens"] = old_tokens + tokens
+                    pos["amount_sol"] = total_amount
+                    pos["entry_price"] = total_amount / pos["tokens"]
+                    old_entry_mcap = _position_entry_mcap(pos, float(pair.get("marketCap", 0) or 0), price)
+                    current_entry_mcap = float(pair.get("marketCap", 0) or 0)
+                    if old_entry_mcap > 0 and current_entry_mcap > 0:
+                        pos["entry_mcap"] = ((old_entry_mcap * old_amount) + (current_entry_mcap * amount)) / total_amount
+                    elif current_entry_mcap > 0:
+                        pos["entry_mcap"] = current_entry_mcap
+                    pos["symbol"] = symbol
+                else:
+                    positions.append({
+                        "address": address, "symbol": symbol,
+                        "name": pair.get("baseToken", {}).get("name", symbol),
+                        "logo_url": (pair.get("info") or {}).get("imageUrl"),
+                        "tokens": tokens, "amount_sol": amount,
+                        "entry_price": price,
+                        "entry_mcap": float(pair.get("marketCap", 0) or 0)
+                    })
+                trade_state["ai_balance_sol"] = max(0.0, balance - amount)
+                trade_state["demo_positions"] = positions
+                save_ai_state_for_user(user.id, trade_state)
+        if insufficient_balance:
+            await query.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
+            return
         asyncio.create_task(notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}"))
         await query.message.reply_text(
             f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
@@ -2333,27 +2374,39 @@ async def button_handler(update, context):
         symbol = (pair or {}).get("baseToken", {}).get("symbol", "TOKEN")
         asyncio.create_task(notify_admin(context, user, "🔴 AI sell selected", f"{symbol} | {address}"))
         price = float(pair.get("priceUsd", 0) or 0) if pair else 0
-        positions = get_demo_positions(user.id)
-        pos = find_demo_position(positions, address)
-        if not pos or price <= 0:
+        if price <= 0:
             await query.message.reply_text("❌ Position or current price unavailable.")
             return
-        sell_fraction = sell_pct / 100.0
-        tokens = float(pos.get("tokens", 0)) * sell_fraction
-        invested = float(pos.get("amount_sol", 0)) * sell_fraction
-        entry = float(pos.get("entry_price", 0))
-        value = tokens * price
-        pnl = value - invested
-        sold_pos = dict(pos)
-        sold_pos["tokens"] = tokens
-        sold_pos["amount_sol"] = invested
-        set_ai_balance(user.id, get_ai_balance(user.id) + value)
-        if sell_pct >= 100.0:
-            positions = [p for p in positions if p.get("address") != address]
-        else:
-            pos["tokens"] = float(pos.get("tokens", 0)) - tokens
-            pos["amount_sol"] = float(pos.get("amount_sol", 0)) - invested
-        save_demo_positions(user.id, positions)
+        position_missing = False
+        with _AI_TRADE_LOCK:
+            trade_state = get_ai_state(user.id)
+            positions = trade_state.get("demo_positions", [])
+            pos = find_demo_position(positions, address)
+            if not pos:
+                position_missing = True
+            else:
+                sell_fraction = sell_pct / 100.0
+                tokens = float(pos.get("tokens", 0)) * sell_fraction
+                invested = float(pos.get("amount_sol", 0)) * sell_fraction
+                entry = float(pos.get("entry_price", 0))
+                value = tokens * price
+                pnl = value - invested
+                sold_pos = dict(pos)
+                sold_pos["tokens"] = tokens
+                sold_pos["amount_sol"] = invested
+                trade_state["ai_balance_sol"] = max(
+                    0.0, float(trade_state.get("ai_balance_sol", 0) or 0) + value
+                )
+                if sell_pct >= 100.0:
+                    positions = [p for p in positions if p is not pos]
+                else:
+                    pos["tokens"] = float(pos.get("tokens", 0)) - tokens
+                    pos["amount_sol"] = float(pos.get("amount_sol", 0)) - invested
+                trade_state["demo_positions"] = positions
+                save_ai_state_for_user(user.id, trade_state)
+        if position_missing:
+            await query.message.reply_text("❌ Position is no longer open.")
+            return
         asyncio.create_task(notify_admin(context, user, "🤖 AI sell", f"{symbol} | Sold {sell_pct:g}% | Value {value:.4f} SOL | PnL {pnl:+.4f} SOL"))
 
         # Check whether the user's AI Mode balance has reached their USD target.
@@ -2712,19 +2765,30 @@ async def handle_message(update, context):
             await update.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
             return
         tokens = amount / price
-        positions = get_demo_positions(user.id)
-        pos = find_demo_position(positions, address)
-        if pos:
-            old_amount = float(pos.get("amount_sol", 0))
-            old_tokens = float(pos.get("tokens", 0))
-            total_amount = old_amount + amount
-            pos["tokens"] = old_tokens + tokens
-            pos["amount_sol"] = total_amount
-            pos["entry_price"] = total_amount / pos["tokens"]
-        else:
-            positions.append({"address": address, "symbol": symbol, "name": pair.get("baseToken", {}).get("name", symbol), "logo_url": (pair.get("info") or {}).get("imageUrl"), "tokens": tokens, "amount_sol": amount, "entry_price": price})
-        set_ai_balance(user.id, balance - amount)
-        save_demo_positions(user.id, positions)
+        with _AI_TRADE_LOCK:
+            trade_state = get_ai_state(user.id)
+            balance = float(trade_state.get("ai_balance_sol", 0) or 0)
+            insufficient_balance = amount > balance
+            positions = trade_state.get("demo_positions", [])
+            if not isinstance(positions, list):
+                positions = []
+            pos = find_demo_position(positions, address)
+            if not insufficient_balance:
+                if pos:
+                    old_amount = float(pos.get("amount_sol", 0))
+                    old_tokens = float(pos.get("tokens", 0))
+                    total_amount = old_amount + amount
+                    pos["tokens"] = old_tokens + tokens
+                    pos["amount_sol"] = total_amount
+                    pos["entry_price"] = total_amount / pos["tokens"]
+                else:
+                    positions.append({"address": address, "symbol": symbol, "name": pair.get("baseToken", {}).get("name", symbol), "logo_url": (pair.get("info") or {}).get("imageUrl"), "tokens": tokens, "amount_sol": amount, "entry_price": price})
+                trade_state["ai_balance_sol"] = max(0.0, balance - amount)
+                trade_state["demo_positions"] = positions
+                save_ai_state_for_user(user.id, trade_state)
+        if insufficient_balance:
+            await update.message.reply_text(f"❌ Insufficient balance. Available: {balance:.4f} SOL")
+            return
         await notify_admin(context, user, "🤖 AI buy", f"{symbol} | {amount:.4f} SOL | Price ${price:.10f}")
         await update.message.reply_text(
             f"✅ *Buy Successful*\n\n🪙 {symbol}\n💸 Spent: {amount:.4f} SOL\n"
